@@ -1,0 +1,13 @@
+[package]
+name = "spec-engine"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "spec_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+spec-core = { path = "../spec-core" }
+pyo3 = { workspace = true }
+numpy = { workspace = true }
