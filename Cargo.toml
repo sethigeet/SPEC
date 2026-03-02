@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/spec-core", "crates/spec-engine"]
+members = ["crates/spec-core", "crates/spec-decode", "crates/spec-engine"]
 resolver = "2"
 
 [workspace.package]
@@ -9,3 +9,12 @@ edition = "2021"
 pyo3 = { version = "0.23", features = ["extension-module"] }
 crossbeam-utils = "0.8"
 numpy = "0.23"
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+hf-hub = "0.4"
+tokenizers = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rand = "0.9"
