@@ -27,6 +27,22 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> candle_core::R
     Ok(m)
 }
 
+#[cfg(feature = "flash-attn")]
+fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> candle_core::Result<Tensor> {
+    candle_flash_attn_v3::flash_attn(q, k, v, softmax_scale, causal, /* use_gqa_packing */ false)
+}
+
+#[cfg(not(feature = "flash-attn"))]
+fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> candle_core::Result<Tensor> {
+    unimplemented!("compile with '--features flash-attn'")
+}
+
 /// Forked causal self-attention that uses [`PagedKVCache`].
 struct CausalSelfAttention {
     q_proj: Linear,
@@ -36,6 +52,7 @@ struct CausalSelfAttention {
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
+    use_flash_attn: bool,
     max_position_embeddings: usize,
 }
 
@@ -99,23 +116,34 @@ impl CausalSelfAttention {
             (k.contiguous()?, v.contiguous()?)
         };
 
-        let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
-        let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
-
-        let in_dtype = q.dtype();
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
-        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-        let att = if seq_len == 1 {
-            att
+        let y = if self.use_flash_attn {
+            // flash-attn expects (b_sz, seq_len, nheads, head_dim)
+            // It handles GQA natively, so no need for repeat_kv.
+            let q = q.transpose(1, 2)?;
+            let k = k.transpose(1, 2)?;
+            let v = v.transpose(1, 2)?;
+            let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
+            flash_attn(&q, &k, &v, softmax_scale, /* causal */ seq_len > 1)?
+                .transpose(1, 2)?
         } else {
-            let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
-            masked_fill(&att, &mask, f32::NEG_INFINITY)?
-        };
+            let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
+            let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
 
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let y = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
+            let in_dtype = q.dtype();
+            let q = q.to_dtype(DType::F32)?;
+            let k = k.to_dtype(DType::F32)?;
+            let v = v.to_dtype(DType::F32)?;
+            let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+            let att = if seq_len == 1 {
+                att
+            } else {
+                let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
+                masked_fill(&att, &mask, f32::NEG_INFINITY)?
+            };
+
+            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
+        };
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
         let y = self.o_proj.forward(&y)?;
         Ok(y)
@@ -137,6 +165,7 @@ impl CausalSelfAttention {
             num_attention_heads: cfg.num_attention_heads,
             num_key_value_heads: cfg.num_key_value_heads,
             head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            use_flash_attn: cfg.use_flash_attn,
             max_position_embeddings: cfg.max_position_embeddings,
         })
     }
@@ -326,7 +355,8 @@ impl CandleLlama {
         let raw = std::fs::read(&config_path)?;
         let llama_config: llama_model::LlamaConfig = serde_json::from_slice(&raw)?;
         let eos_token_id = llama_config.eos_token_id.clone();
-        let config = llama_config.into_config(false); // no flash-attn on CPU
+        let use_flash_attn = cfg!(feature = "flash-attn");
+        let config = llama_config.into_config(use_flash_attn);
 
         // Weights — try single file first, fall back to sharded index
         let filenames = {

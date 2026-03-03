@@ -7,6 +7,9 @@ edition.workspace = true
 name = "spec_engine"
 crate-type = ["cdylib"]
 
+[features]
+flash-attn = ["spec-decode/flash-attn"]
+
 [dependencies]
 spec-core = { path = "../spec-core" }
 spec-decode = { path = "../spec-decode" }
