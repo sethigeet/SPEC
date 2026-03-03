@@ -30,6 +30,8 @@ pub struct SpecDecoder {
     pub gamma: usize,
     /// RNG for rejection sampling (separate from the sampler RNG).
     rng: rand::rngs::StdRng,
+    /// Current epoch for KV cache tagging (incremented on rollback).
+    epoch: usize,
 }
 
 impl SpecDecoder {
@@ -48,15 +50,14 @@ impl SpecDecoder {
             sampler,
             gamma,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
+            epoch: 0,
         }
     }
 
     /// Process the prompt through both models to fill their KV caches.
-    /// Returns the logits from the target model for the last prompt token.
     fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<()> {
-        // Process entire prompt through both models.
-        let _draft_logits = self.draft.forward(prompt_tokens)?;
-        let _target_logits = self.target.forward(prompt_tokens)?;
+        let _draft_logits = self.draft.forward(prompt_tokens, self.epoch)?;
+        let _target_logits = self.target.forward(prompt_tokens, self.epoch)?;
         Ok(())
     }
 
@@ -76,7 +77,7 @@ impl SpecDecoder {
         let last_token = *tokens.last().unwrap();
 
         // First draft step: feed the last accepted token.
-        let draft_logits = self.draft.forward(&[last_token])?;
+        let draft_logits = self.draft.forward(&[last_token], self.epoch)?;
         let draft_p = Sampler::logits_to_probs(&draft_logits)?;
         let draft_tok = self.sampler.sample(&draft_logits, tokens)?;
         draft_tokens.push(draft_tok);
@@ -85,7 +86,7 @@ impl SpecDecoder {
         // Remaining γ-1 draft steps
         for _ in 1..self.gamma {
             let prev = *draft_tokens.last().unwrap();
-            let draft_logits = self.draft.forward(&[prev])?;
+            let draft_logits = self.draft.forward(&[prev], self.epoch)?;
             let draft_p = Sampler::logits_to_probs(&draft_logits)?;
             let draft_tok = self.sampler.sample(&draft_logits, tokens)?;
             draft_tokens.push(draft_tok);
@@ -93,26 +94,12 @@ impl SpecDecoder {
         }
 
         // ── 2. Verify phase ─────────────────────────────────────────
-        // Feed the last accepted token + all draft tokens (except the last)
-        // through the target model. We need target logits at positions
-        // corresponding to each draft token.
-        //
-        // Position layout:
-        //   target gets [last_token, draft[0], draft[1], ..., draft[γ-1]]
-        //   target logits[i] = distribution for position *after* input[i]
-        //   So target logits[0] corresponds to draft[0]'s position
-        //   And target logits[γ] corresponds to the bonus position
-        //
-        // Since candle's forward only returns last-position logits, we use
-        // forward_each to get logits at each position.
+        // Feed the last accepted token + all draft tokens through the target
+        // model one at a time, collecting logits at each position.
         let verify_input: Vec<u32> = std::iter::once(last_token)
             .chain(draft_tokens.iter().copied())
             .collect();
-        let target_logits_list = self.target.forward_each(&verify_input)?;
-
-        // target_logits_list[i] = logits after seeing verify_input[i]
-        // target_logits_list[0] = logits at draft_tokens[0]'s position
-        // target_logits_list[γ]   = bonus position logits
+        let target_logits_list = self.target.forward_each(&verify_input, self.epoch)?;
 
         // ── 3. Rejection sampling ────────────────────────────────────
         let mut accepted_count = 0;
@@ -145,18 +132,12 @@ impl SpecDecoder {
                 tokens.push(correction_token);
                 accepted_count += 1; // the correction token counts
 
-                // Rollback draft model cache to the current position
-                let new_pos = tokens.len();
-                self.draft.truncate_cache_to(tokens, new_pos)?;
-
-                // Rollback target model cache — we've already processed up to
-                // verify_input[i], but we need to be at `new_pos`.
-                // The target cache already has the right state up to this point
-                // since we processed token-by-token. We just need to truncate
-                // any extra cache entries from positions beyond the rejection.
-                // Since forward_each processes one at a time, the target cache
-                // has entries for all γ+1 positions. We need to truncate.
-                self.target.truncate_cache_to(tokens, new_pos)?;
+                // Rollback both model caches to the current position.
+                // With paged cache, this is O(1) — just free blocks beyond
+                // the accepted position.
+                let new_len = tokens.len();
+                self.draft.truncate_cache_to(new_len);
+                self.target.truncate_cache_to(new_len);
 
                 return Ok(StepResult {
                     accepted: accepted_count,
@@ -173,10 +154,10 @@ impl SpecDecoder {
         tokens.push(bonus_token);
         accepted_count += 1;
 
-        // The draft model cache is now γ positions ahead of the target's
-        // last verified position. Reset it to match.
-        let new_pos = tokens.len();
-        self.draft.truncate_cache_to(tokens, new_pos)?;
+        // The draft model cache produced γ extra draft tokens that weren't
+        // all verified. Truncate its cache to match the accepted length.
+        let new_len = tokens.len();
+        self.draft.truncate_cache_to(new_len);
 
         Ok(StepResult {
             accepted: accepted_count,

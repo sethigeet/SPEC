@@ -247,14 +247,8 @@ impl SpecDecodingEngine {
     #[pyo3(signature = (prompt, max_tokens = 100))]
     fn generate(&mut self, prompt: &str, max_tokens: usize) -> PyResult<String> {
         // Reset caches for a fresh generation
-        self.decoder
-            .draft
-            .reset_cache()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
-        self.decoder
-            .target
-            .reset_cache()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+        self.decoder.draft.reset_cache();
+        self.decoder.target.reset_cache();
 
         let encoding = self
             .tokenizer
@@ -289,14 +283,8 @@ impl SpecDecodingEngine {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
     ) -> PyResult<Vec<u32>> {
-        self.decoder
-            .draft
-            .reset_cache()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
-        self.decoder
-            .target
-            .reset_cache()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+        self.decoder.draft.reset_cache();
+        self.decoder.target.reset_cache();
 
         let all_tokens = self
             .decoder
