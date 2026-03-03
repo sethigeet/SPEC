@@ -14,8 +14,6 @@ flash-attn = ["spec-decode/flash-attn"]
 spec-core = { path = "../spec-core" }
 spec-decode = { path = "../spec-decode" }
 pyo3 = { workspace = true }
-numpy = { workspace = true }
-anyhow = { workspace = true }
 candle-core = { workspace = true }
 tokenizers = { workspace = true }
 
