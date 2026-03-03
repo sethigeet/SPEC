@@ -205,8 +205,18 @@ impl SpecDecodingEngine {
         repeat_last_n: usize,
         revision: &str,
     ) -> PyResult<Self> {
-        let device = candle_core::Device::Cpu;
-        let dtype = candle_core::DType::F32;
+        let device = if cfg!(feature = "cuda") {
+            candle_core::Device::cuda_if_available(0).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA init: {e}"))
+            })?
+        } else {
+            candle_core::Device::Cpu
+        };
+        let dtype = if device.is_cuda() {
+            candle_core::DType::BF16
+        } else {
+            candle_core::DType::F32
+        };
 
         let draft = CandleLlama::from_hub(draft_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;

@@ -177,7 +177,7 @@ impl SpecDecoder {
         let sum: f32 = adjusted.iter().sum();
         if sum <= 0.0 {
             // Fallback: sample from target distribution directly
-            let logits = Tensor::new(target_p, &candle_core::Device::Cpu)?;
+            let logits = Tensor::new(target_p, &self.target.cfg.device)?;
             return self.sampler.sample(&logits, &[]);
         }
 

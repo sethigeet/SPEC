@@ -8,6 +8,7 @@ name = "spec_engine"
 crate-type = ["cdylib"]
 
 [features]
+cuda = ["spec-decode/cuda"]
 flash-attn = ["spec-decode/flash-attn"]
 
 [dependencies]
