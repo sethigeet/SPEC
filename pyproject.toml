@@ -6,6 +6,9 @@ build-backend = "maturin"
 name = "spec-engine"
 version = "0.1.0"
 requires-python = ">=3.9"
+dependencies = [
+    "patchelf>=0.17.2.4",
+]
 
 [tool.maturin]
 manifest-path = "crates/spec-engine/Cargo.toml"
