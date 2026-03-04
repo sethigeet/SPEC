@@ -25,10 +25,12 @@ use std::thread;
 
 use anyhow::Result;
 use candle_core::Tensor;
+use log::{debug, info, trace};
 use rand::Rng;
 
 use spec_core::{DraftQueue, DraftToken, EngineState};
 
+use crate::decode::SpecStats;
 use crate::model::CandleLlama;
 use crate::sampler::Sampler;
 
@@ -94,6 +96,7 @@ impl AsyncSpecPipeline {
     /// on a producer thread and the target model on a consumer thread.
     ///
     /// Returns the full token sequence (prompt + generated).
+    /// Acceptance statistics are logged at `info` level.
     pub fn generate(&mut self, prompt_tokens: Vec<u32>, max_new_tokens: usize) -> Result<Vec<u32>> {
         // Take models out of the Option — they'll be put back after join.
         let mut draft_model = self
@@ -106,8 +109,10 @@ impl AsyncSpecPipeline {
             .expect("target model not available (already consumed)");
 
         // ── Prefill both models sequentially ─────────────────────────
+        debug!("prefilling {} prompt tokens", prompt_tokens.len());
         let _draft_logits = draft_model.forward(&prompt_tokens, 0)?;
         let _target_logits = target_model.forward(&prompt_tokens, 0)?;
+        debug!("prefill complete");
 
         let initial_len = prompt_tokens.len();
         let last_prompt_token = *prompt_tokens.last().unwrap();
@@ -121,8 +126,16 @@ impl AsyncSpecPipeline {
         // The accepted output sequence (written by consumer, read at end).
         let output = Arc::new(Mutex::new(prompt_tokens.clone()));
 
+        // Acceptance statistics (written by consumer).
+        let stats = Arc::new(Mutex::new(SpecStats::new()));
+
         let gamma = self.gamma;
         let seed = self.seed;
+
+        info!(
+            "starting async speculative decoding: prompt_len={}, max_new_tokens={}, gamma={}",
+            initial_len, max_new_tokens, gamma
+        );
 
         // ── Producer thread (draft model) ────────────────────────────
         let q_prod = Arc::clone(&queue);
@@ -146,6 +159,11 @@ impl AsyncSpecPipeline {
                     // accepted sequence length.
                     let target_len = o_prod.lock().unwrap().len();
                     model.truncate_cache_to(target_len);
+
+                    debug!(
+                        "producer: rollback to epoch={}, corrected_token={}, cache_len={}",
+                        new_epoch, corrected, target_len
+                    );
 
                     local_epoch = new_epoch;
                     next_token = corrected;
@@ -195,6 +213,7 @@ impl AsyncSpecPipeline {
         let s_cons = Arc::clone(&state);
         let d_cons = Arc::clone(&done);
         let o_cons = Arc::clone(&output);
+        let st_cons = Arc::clone(&stats);
 
         let consumer = thread::spawn(move || -> Result<CandleLlama> {
             use rand::SeedableRng;
@@ -277,6 +296,19 @@ impl AsyncSpecPipeline {
                         out.push(drafted_id);
                         total_generated = out.len() - initial_len;
 
+                        {
+                            let mut s = st_cons.lock().unwrap();
+                            s.draft_proposed += 1;
+                            s.draft_accepted += 1;
+                            s.num_steps += 1;
+                        }
+
+                        trace!(
+                            "consumer: accepted draft token {}, total_generated={}",
+                            drafted_id,
+                            total_generated
+                        );
+
                         if model.is_eos(drafted_id) {
                             drop(out);
                             d_cons.store(true, Ordering::Release);
@@ -291,6 +323,18 @@ impl AsyncSpecPipeline {
                             out.push(corrected);
                             total_generated = out.len() - initial_len;
                         }
+
+                        {
+                            let mut s = st_cons.lock().unwrap();
+                            s.draft_proposed += 1;
+                            // draft_accepted NOT incremented — this was a rejection
+                            s.num_steps += 1;
+                        }
+
+                        debug!(
+                            "consumer: rejected draft token {}, corrected to {}, total_generated={}",
+                            drafted_id, corrected, total_generated
+                        );
 
                         // Truncate target cache to the new accepted length
                         let accepted_len = {
@@ -333,6 +377,19 @@ impl AsyncSpecPipeline {
         if tokens.len() > max_len {
             tokens.truncate(max_len);
         }
+
+        let mut final_stats = stats.lock().unwrap().clone();
+        final_stats.total_tokens = tokens.len();
+
+        info!(
+            "async generation complete: steps={}, draft_proposed={}, draft_accepted={}, acceptance_rate={:.1}%, avg_accepted_per_step={:.2}, total_tokens={}",
+            final_stats.num_steps,
+            final_stats.draft_proposed,
+            final_stats.draft_accepted,
+            final_stats.acceptance_rate() * 100.0,
+            final_stats.avg_accepted_per_step(),
+            final_stats.total_tokens,
+        );
 
         Ok(tokens)
     }

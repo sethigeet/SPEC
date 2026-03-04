@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 crossbeam-utils = { workspace = true }
 candle-core = { workspace = true }
+log = { workspace = true }

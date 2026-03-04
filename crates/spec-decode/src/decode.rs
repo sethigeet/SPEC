@@ -3,6 +3,10 @@
 //! Implements the algorithm from "Fast Inference from Transformers via
 //! Speculative Decoding" (Leviathan et al., 2023).
 //!
+//! After generation, [`SpecStats`] provides acceptance metrics:
+//! `acceptance_rate()` returns the fraction of draft tokens accepted by the
+//! target model.
+//!
 //! # Algorithm
 //!
 //! ```text
@@ -16,6 +20,7 @@
 
 use anyhow::Result;
 use candle_core::Tensor;
+use log::{debug, info, trace};
 use rand::Rng;
 
 use crate::model::CandleLlama;
@@ -56,8 +61,10 @@ impl SpecDecoder {
 
     /// Process the prompt through both models to fill their KV caches.
     fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<()> {
+        debug!("prefilling {} prompt tokens", prompt_tokens.len());
         let _draft_logits = self.draft.forward(prompt_tokens, self.epoch)?;
         let _target_logits = self.target.forward(prompt_tokens, self.epoch)?;
+        debug!("prefill complete");
         Ok(())
     }
 
@@ -102,7 +109,7 @@ impl SpecDecoder {
         let target_logits_list = self.target.forward_each(&verify_input, self.epoch)?;
 
         // ── 3. Rejection sampling ────────────────────────────────────
-        let mut accepted_count = 0;
+        let mut draft_accepted = 0;
 
         for i in 0..self.gamma {
             let target_p = Sampler::logits_to_probs(&target_logits_list[i])?;
@@ -122,15 +129,14 @@ impl SpecDecoder {
 
             let r: f32 = self.rng.random();
             if r < accept_prob {
-                // Accept this token
+                // Accept this draft token
                 tokens.push(draft_tokens[i]);
-                accepted_count += 1;
+                draft_accepted += 1;
             } else {
                 // Reject — sample correction token from
                 // norm(max(0, p_target - p_draft))
                 let correction_token = self.sample_correction(&target_p, draft_p)?;
                 tokens.push(correction_token);
-                accepted_count += 1; // the correction token counts
 
                 // Rollback both model caches to the current position.
                 // With paged cache, this is O(1) — just free blocks beyond
@@ -140,7 +146,8 @@ impl SpecDecoder {
                 self.target.truncate_cache_to(new_len);
 
                 return Ok(StepResult {
-                    accepted: accepted_count,
+                    draft_accepted,
+                    draft_proposed: self.gamma,
                     hit_eos: self.draft.is_eos(correction_token)
                         || self.target.is_eos(correction_token),
                 });
@@ -149,10 +156,13 @@ impl SpecDecoder {
 
         // ── 4. All accepted — bonus token ────────────────────────────
         // Sample from the last target logits (position γ).
+        debug!(
+            "all {} draft tokens accepted, sampling bonus token",
+            self.gamma
+        );
         let bonus_logits = &target_logits_list[self.gamma];
         let bonus_token = self.sampler.sample(bonus_logits, tokens)?;
         tokens.push(bonus_token);
-        accepted_count += 1;
 
         // The draft model cache produced γ extra draft tokens that weren't
         // all verified. Truncate its cache to match the accepted length.
@@ -160,7 +170,8 @@ impl SpecDecoder {
         self.draft.truncate_cache_to(new_len);
 
         Ok(StepResult {
-            accepted: accepted_count,
+            draft_accepted,
+            draft_proposed: self.gamma,
             hit_eos: self.draft.is_eos(bonus_token) || self.target.is_eos(bonus_token),
         })
     }
@@ -203,6 +214,7 @@ impl SpecDecoder {
     /// Generate tokens from a prompt using speculative decoding.
     ///
     /// Returns the full sequence (prompt + generated tokens).
+    /// Acceptance statistics are logged at `info` level.
     pub fn generate(&mut self, prompt_tokens: Vec<u32>, max_new_tokens: usize) -> Result<Vec<u32>> {
         let mut tokens = prompt_tokens;
 
@@ -211,12 +223,31 @@ impl SpecDecoder {
 
         let initial_len = tokens.len();
         let mut total_generated = 0;
+        let mut stats = SpecStats::new();
+
+        info!(
+            "starting speculative decoding: prompt_len={}, max_new_tokens={}, gamma={}",
+            initial_len, max_new_tokens, self.gamma
+        );
 
         while total_generated < max_new_tokens {
             let result = self.step(&mut tokens)?;
             total_generated = tokens.len() - initial_len;
 
+            stats.num_steps += 1;
+            stats.draft_proposed += result.draft_proposed;
+            stats.draft_accepted += result.draft_accepted;
+
+            trace!(
+                "step {}: accepted {}/{} draft tokens, total_generated={}",
+                stats.num_steps,
+                result.draft_accepted,
+                result.draft_proposed,
+                total_generated
+            );
+
             if result.hit_eos {
+                debug!("EOS token encountered, stopping generation");
                 break;
             }
         }
@@ -227,15 +258,79 @@ impl SpecDecoder {
             tokens.truncate(max_len);
         }
 
+        stats.total_tokens = tokens.len();
+
+        info!(
+            "generation complete: steps={}, draft_proposed={}, draft_accepted={}, acceptance_rate={:.1}%, avg_accepted_per_step={:.2}, total_tokens={}",
+            stats.num_steps,
+            stats.draft_proposed,
+            stats.draft_accepted,
+            stats.acceptance_rate() * 100.0,
+            stats.avg_accepted_per_step(),
+            stats.total_tokens,
+        );
+
         Ok(tokens)
     }
 }
 
 /// Result of a single speculative step.
-#[allow(dead_code)]
 struct StepResult {
-    /// Number of tokens accepted (including correction/bonus).
-    accepted: usize,
+    /// Number of draft tokens that were accepted by the target model.
+    draft_accepted: usize,
+    /// Number of draft tokens proposed in this step.
+    draft_proposed: usize,
     /// Whether an EOS token was generated.
     hit_eos: bool,
+}
+
+/// Statistics from a speculative decoding run.
+#[derive(Debug, Clone)]
+pub struct SpecStats {
+    /// Total number of draft tokens proposed across all steps.
+    pub draft_proposed: usize,
+    /// Number of draft tokens accepted by the target model.
+    pub draft_accepted: usize,
+    /// Total number of speculative decoding steps.
+    pub num_steps: usize,
+    /// Total tokens generated (including prompt).
+    pub total_tokens: usize,
+}
+
+impl SpecStats {
+    /// Create empty stats.
+    pub fn new() -> Self {
+        Self {
+            draft_proposed: 0,
+            draft_accepted: 0,
+            num_steps: 0,
+            total_tokens: 0,
+        }
+    }
+
+    /// Draft token acceptance rate as a fraction in [0.0, 1.0].
+    ///
+    /// Returns 0.0 if no tokens were proposed.
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.draft_proposed == 0 {
+            0.0
+        } else {
+            self.draft_accepted as f64 / self.draft_proposed as f64
+        }
+    }
+
+    /// Average number of draft tokens accepted per step.
+    pub fn avg_accepted_per_step(&self) -> f64 {
+        if self.num_steps == 0 {
+            0.0
+        } else {
+            self.draft_accepted as f64 / self.num_steps as f64
+        }
+    }
+}
+
+impl Default for SpecStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }

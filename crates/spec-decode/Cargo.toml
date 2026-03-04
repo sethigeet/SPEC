@@ -18,3 +18,4 @@ tokenizers = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
+log = { workspace = true }

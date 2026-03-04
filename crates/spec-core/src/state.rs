@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
+use log::{debug, trace};
 
 use crate::spsc::DraftQueue;
 
@@ -53,6 +54,7 @@ impl EngineState {
     /// Called by the **producer** after it has reset its local state in response
     /// to a flush. Clears the flush flag so the producer can resume drafting.
     pub fn acknowledge_flush(&self) {
+        trace!("producer acknowledged flush, clearing flush flag");
         self.flush_flag.store(false, Ordering::Release);
     }
 
@@ -68,6 +70,11 @@ impl EngineState {
     /// queue when this is called. In practice, the producer polls `flush_flag`
     /// before every push, so the queue quiesces naturally.
     pub fn trigger_rollback(&self, corrected_token: i64, queue: &DraftQueue) {
+        let new_epoch = self.epoch.load(Ordering::Relaxed) + 1;
+        debug!(
+            "rollback triggered: corrected_token={}, new_epoch={}",
+            corrected_token, new_epoch
+        );
         self.last_valid_token.store(corrected_token, Ordering::Release);
         self.flush_flag.store(true, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::Release);

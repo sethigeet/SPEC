@@ -1,3 +1,4 @@
+use log::info;
 use pyo3::prelude::*;
 
 use spec_core::{DraftQueue, DraftToken, EngineState, KVBlockAllocator};
@@ -143,6 +144,9 @@ impl AsyncSpecEngine {
 /// Loads a draft and target Llama-family model from HuggingFace Hub, then
 /// generates tokens using the speculative decoding algorithm.
 ///
+/// Acceptance statistics are logged automatically — set the ``SPEC_LOG``
+/// environment variable to control verbosity (e.g. ``SPEC_LOG=info``).
+///
 /// # Usage from Python
 ///
 /// ```python
@@ -217,9 +221,17 @@ impl SpecDecodingEngine {
             candle_core::DType::F32
         };
 
+        info!(
+            "loading draft model '{}' on {:?} ({:?})",
+            draft_model_id, device, dtype
+        );
         let draft = CandleLlama::from_hub(draft_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;
 
+        info!(
+            "loading target model '{}' on {:?} ({:?})",
+            target_model_id, device, dtype
+        );
         let target = CandleLlama::from_hub(target_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}")))?;
 
@@ -237,6 +249,11 @@ impl SpecDecodingEngine {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}")))?;
 
         let decoder = SpecDecoder::new(draft, target, sampler, gamma, seed);
+
+        info!(
+            "SpecDecodingEngine ready: gamma={}, temperature={}, seed={}",
+            gamma, temperature, seed
+        );
 
         Ok(Self { decoder, tokenizer })
     }
@@ -309,6 +326,9 @@ impl SpecDecodingEngine {
 /// generates speculative tokens via a lock-free SPSC queue while the target
 /// model verifies them.
 ///
+/// Acceptance statistics are logged automatically — set the ``SPEC_LOG``
+/// environment variable to control verbosity (e.g. ``SPEC_LOG=info``).
+///
 /// # Usage from Python
 ///
 /// ```python
@@ -366,9 +386,17 @@ impl AsyncSpecDecodingEngine {
             candle_core::DType::F32
         };
 
+        info!(
+            "loading draft model '{}' on {:?} ({:?})",
+            draft_model_id, device, dtype
+        );
         let draft = CandleLlama::from_hub(draft_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;
 
+        info!(
+            "loading target model '{}' on {:?} ({:?})",
+            target_model_id, device, dtype
+        );
         let target = CandleLlama::from_hub(target_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}")))?;
 
@@ -386,6 +414,11 @@ impl AsyncSpecDecodingEngine {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}")))?;
 
         let pipeline = AsyncSpecPipeline::new(draft, target, sampler, gamma, seed);
+
+        info!(
+            "AsyncSpecDecodingEngine ready: gamma={}, seed={}",
+            gamma, seed
+        );
 
         Ok(Self {
             pipeline,
@@ -449,9 +482,29 @@ impl AsyncSpecDecodingEngine {
     }
 }
 
+/// Initialise the logger from the ``SPEC_LOG`` environment variable.
+///
+/// Called automatically when the Python module is imported. Examples:
+///
+/// ```bash
+/// SPEC_LOG=info python run.py          # acceptance stats + model loading
+/// SPEC_LOG=debug python run.py         # + rollback events, per-step detail
+/// SPEC_LOG=trace python run.py         # + every accepted token
+/// SPEC_LOG=spec_decode=debug python …  # target only the decode crate
+/// ```
+fn init_logger() {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::new()
+            .filter_or("SPEC_LOG", "warn")
+    )
+    .try_init();
+}
+
 /// Python module definition.
 #[pymodule]
 fn spec_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    init_logger();
+
     m.add_class::<AsyncSpecEngine>()?;
     m.add_class::<SpecDecodingEngine>()?;
     m.add_class::<AsyncSpecDecodingEngine>()?;
