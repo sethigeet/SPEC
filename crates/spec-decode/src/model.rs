@@ -7,7 +7,9 @@
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{embedding, linear, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{
+    embedding, linear, linear_no_bias, Embedding, Linear, Module, RmsNorm, VarBuilder,
+};
 use candle_transformers::models::llama as llama_model;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use spec_core::paged_kv_cache::{PagedCacheConfig, PagedKVCache, RopeScaling};
@@ -21,10 +23,26 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> candle_core::Result<Tensor> {
 
 fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> candle_core::Result<Tensor> {
     let shape = mask.shape();
-    let on_true =
-        Tensor::new(on_true, on_false.device())?.broadcast_as(shape.dims())?;
+    let on_true = Tensor::new(on_true, on_false.device())?.broadcast_as(shape.dims())?;
     let m = mask.where_cond(&on_true, on_false)?;
     Ok(m)
+}
+
+/// Some Llama-family checkpoints omit projection biases (e.g. SmolLM2).
+/// Try loading a biased linear first, then fall back to bias-free tensors.
+fn load_linear_with_optional_bias(
+    in_features: usize,
+    out_features: usize,
+    vb: VarBuilder,
+) -> candle_core::Result<Linear> {
+    // Some checkpoints (e.g. SmolLM2) do not include `*.bias`.
+    // So we fall back to a bias-free projection.
+    let result = linear(in_features, out_features, vb.clone());
+    if result.is_ok() {
+        return result;
+    }
+
+    linear_no_bias(in_features, out_features, vb.clone())
 }
 
 #[cfg(feature = "flash-attn")]
@@ -35,7 +53,14 @@ fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> candle_core::Result<Tensor> {
-    candle_flash_attn_v3::flash_attn(q, k, v, softmax_scale, causal, /* use_gqa_packing */ false)
+    candle_flash_attn_v3::flash_attn(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        /* use_gqa_packing */ false,
+    )
 }
 
 #[cfg(not(feature = "flash-attn"))]
@@ -102,12 +127,20 @@ impl CausalSelfAttention {
         let k_seq_len = k.dim(2)?;
         let (k, v) = if k_seq_len > self.max_position_embeddings {
             let k = k
-                .narrow(2, k_seq_len - self.max_position_embeddings, self.max_position_embeddings)?
+                .narrow(
+                    2,
+                    k_seq_len - self.max_position_embeddings,
+                    self.max_position_embeddings,
+                )?
                 .contiguous()?;
             let v_seq_len = v.dim(2)?;
             let v = if v_seq_len > self.max_position_embeddings {
-                v.narrow(2, v_seq_len - self.max_position_embeddings, self.max_position_embeddings)?
-                    .contiguous()?
+                v.narrow(
+                    2,
+                    v_seq_len - self.max_position_embeddings,
+                    self.max_position_embeddings,
+                )?
+                .contiguous()?
             } else {
                 v.contiguous()?
             };
@@ -123,8 +156,7 @@ impl CausalSelfAttention {
             let k = k.transpose(1, 2)?;
             let v = v.transpose(1, 2)?;
             let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-            flash_attn(&q, &k, &v, softmax_scale, /* causal */ seq_len > 1)?
-                .transpose(1, 2)?
+            flash_attn(&q, &k, &v, softmax_scale, /* causal */ seq_len > 1)?.transpose(1, 2)?
         } else {
             let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
             let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
@@ -153,10 +185,10 @@ impl CausalSelfAttention {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        let q_proj = linear(size_in, size_q, vb.pp("q_proj"))?;
-        let k_proj = linear(size_in, size_kv, vb.pp("k_proj"))?;
-        let v_proj = linear(size_in, size_kv, vb.pp("v_proj"))?;
-        let o_proj = linear(size_q, size_in, vb.pp("o_proj"))?;
+        let q_proj = load_linear_with_optional_bias(size_in, size_q, vb.pp("q_proj"))?;
+        let k_proj = load_linear_with_optional_bias(size_in, size_kv, vb.pp("k_proj"))?;
+        let v_proj = load_linear_with_optional_bias(size_in, size_kv, vb.pp("v_proj"))?;
+        let o_proj = load_linear_with_optional_bias(size_q, size_in, vb.pp("o_proj"))?;
         Ok(Self {
             q_proj,
             k_proj,
@@ -186,9 +218,9 @@ impl Mlp {
     fn load(vb: VarBuilder, cfg: &llama_model::Config) -> candle_core::Result<Self> {
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
-        let c_fc1 = linear(h_size, i_size, vb.pp("gate_proj"))?;
-        let c_fc2 = linear(h_size, i_size, vb.pp("up_proj"))?;
-        let c_proj = linear(i_size, h_size, vb.pp("down_proj"))?;
+        let c_fc1 = load_linear_with_optional_bias(h_size, i_size, vb.pp("gate_proj"))?;
+        let c_fc2 = load_linear_with_optional_bias(h_size, i_size, vb.pp("up_proj"))?;
+        let c_proj = load_linear_with_optional_bias(i_size, h_size, vb.pp("down_proj"))?;
         Ok(Self {
             c_fc1,
             c_fc2,
@@ -224,7 +256,8 @@ impl Block {
     fn load(vb: VarBuilder, cfg: &llama_model::Config) -> candle_core::Result<Self> {
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg)?;
         let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
-        let rms_1 = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let rms_1 =
+            candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let rms_2 = candle_nn::rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -275,8 +308,8 @@ impl PagedLlama {
         };
         let ln_f = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
-            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg).unwrap())
-            .collect();
+            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg))
+            .collect::<candle_core::Result<_>>()?;
         Ok(Self {
             wte,
             blocks,

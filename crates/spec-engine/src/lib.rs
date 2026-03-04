@@ -63,7 +63,7 @@ impl AsyncSpecEngine {
     ///     kv_ptr: Opaque KV cache pointer/index from the draft model.
     fn push_draft_token(&self, token_id: i64, kv_ptr: usize) -> bool {
         let _ = kv_ptr; // reserved for future use (e.g. storing draft model VRAM address)
-        // Check rollback first
+                        // Check rollback first
         if self.state.needs_flush() {
             return false;
         }
@@ -206,9 +206,8 @@ impl SpecDecodingEngine {
         revision: &str,
     ) -> PyResult<Self> {
         let device = if cfg!(feature = "cuda") {
-            candle_core::Device::cuda_if_available(0).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA init: {e}"))
-            })?
+            candle_core::Device::cuda_if_available(0)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA init: {e}")))?
         } else {
             candle_core::Device::Cpu
         };
@@ -222,9 +221,7 @@ impl SpecDecodingEngine {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;
 
         let target = CandleLlama::from_hub(target_model_id, revision, &device, dtype)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}"))
-            })?;
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}")))?;
 
         let sampler_cfg = SamplerConfig {
             temperature,
@@ -237,9 +234,7 @@ impl SpecDecodingEngine {
         let sampler = Sampler::new(&sampler_cfg);
 
         let tokenizer = spec_decode::model::load_tokenizer(target_model_id, revision)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}"))
-            })?;
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}")))?;
 
         let decoder = SpecDecoder::new(draft, target, sampler, gamma, seed);
 
@@ -360,9 +355,8 @@ impl AsyncSpecDecodingEngine {
         revision: &str,
     ) -> PyResult<Self> {
         let device = if cfg!(feature = "cuda") {
-            candle_core::Device::cuda_if_available(0).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA init: {e}"))
-            })?
+            candle_core::Device::cuda_if_available(0)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA init: {e}")))?
         } else {
             candle_core::Device::Cpu
         };
@@ -376,9 +370,7 @@ impl AsyncSpecDecodingEngine {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;
 
         let target = CandleLlama::from_hub(target_model_id, revision, &device, dtype)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}"))
-            })?;
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}")))?;
 
         let sampler_cfg = SamplerConfig {
             temperature: 0.0,
@@ -391,9 +383,7 @@ impl AsyncSpecDecodingEngine {
         let sampler = Sampler::new(&sampler_cfg);
 
         let tokenizer = spec_decode::model::load_tokenizer(target_model_id, revision)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}"))
-            })?;
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}")))?;
 
         let pipeline = AsyncSpecPipeline::new(draft, target, sampler, gamma, seed);
 
@@ -467,4 +457,3 @@ fn spec_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AsyncSpecDecodingEngine>()?;
     Ok(())
 }
-
