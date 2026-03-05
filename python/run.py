@@ -1,4 +1,4 @@
-from spec_engine.spec_engine import SpecDecodingEngine
+from SPEC.SPEC.engines import SpecDecodingEngine
 
 engine = SpecDecodingEngine(
     draft_model_id="HuggingFaceTB/SmolLM2-135M",

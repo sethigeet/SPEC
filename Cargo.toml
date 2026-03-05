@@ -6,7 +6,7 @@ resolver = "2"
 edition = "2021"
 
 [workspace.dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.28.2", features = ["extension-module"] }
 crossbeam-utils = "0.8"
 candle-core = { version = "0.9", default-features = false }
 candle-nn = "0.9"

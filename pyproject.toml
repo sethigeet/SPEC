@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "spec-engine"
+name = "SPEC"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
@@ -13,7 +13,7 @@ dependencies = [
 [tool.maturin]
 manifest-path = "crates/spec-engine/Cargo.toml"
 features = ["pyo3/extension-module"]
-module-name = "spec_engine"
+module-name = "SPEC"
 
 [dependency-groups]
 dev = [
