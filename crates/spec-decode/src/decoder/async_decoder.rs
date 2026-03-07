@@ -30,8 +30,8 @@ use rand::Rng;
 
 use spec_core::{DraftQueue, DraftToken, EngineState};
 
-use crate::decode::SpecStats;
-use crate::model::CandleLlama;
+use crate::decoder::stats::Stats;
+use crate::model::Llama;
 use crate::sampler::Sampler;
 
 /// Async continuous speculative decoding pipeline.
@@ -39,12 +39,12 @@ use crate::sampler::Sampler;
 /// Coordinates a draft model and a target model running on separate threads,
 /// using a lock-free SPSC queue for token transfer and an epoch-based state
 /// machine for rollback coordination.
-pub struct AsyncSpecPipeline {
+pub struct AsyncDecoder {
     /// Draft model (small/fast). Wrapped in `Option` so we can move it to the
     /// producer thread and get it back after join.
-    draft: Option<CandleLlama>,
+    draft: Option<Llama>,
     /// Target model (large/accurate). Same `Option` pattern.
-    target: Option<CandleLlama>,
+    target: Option<Llama>,
     pub sampler: Sampler,
     /// Number of draft tokens to generate before the consumer tries to verify.
     pub gamma: usize,
@@ -52,15 +52,9 @@ pub struct AsyncSpecPipeline {
     pub seed: u64,
 }
 
-impl AsyncSpecPipeline {
+impl AsyncDecoder {
     /// Create a new async speculative decoding pipeline.
-    pub fn new(
-        draft: CandleLlama,
-        target: CandleLlama,
-        sampler: Sampler,
-        gamma: usize,
-        seed: u64,
-    ) -> Self {
+    pub fn new(draft: Llama, target: Llama, sampler: Sampler, gamma: usize, seed: u64) -> Self {
         Self {
             draft: Some(draft),
             target: Some(target),
@@ -71,14 +65,14 @@ impl AsyncSpecPipeline {
     }
 
     /// Mutable reference to the draft model. Panics if the model was consumed.
-    pub fn draft_mut(&mut self) -> &mut CandleLlama {
+    pub fn draft_mut(&mut self) -> &mut Llama {
         self.draft
             .as_mut()
             .expect("draft model not available (consumed by generate)")
     }
 
     /// Mutable reference to the target model. Panics if the model was consumed.
-    pub fn target_mut(&mut self) -> &mut CandleLlama {
+    pub fn target_mut(&mut self) -> &mut Llama {
         self.target
             .as_mut()
             .expect("target model not available (consumed by generate)")
@@ -127,7 +121,7 @@ impl AsyncSpecPipeline {
         let output = Arc::new(Mutex::new(prompt_tokens.clone()));
 
         // Acceptance statistics (written by consumer).
-        let stats = Arc::new(Mutex::new(SpecStats::new()));
+        let stats = Arc::new(Mutex::new(Stats::new()));
 
         let gamma = self.gamma;
         let seed = self.seed;
@@ -143,7 +137,7 @@ impl AsyncSpecPipeline {
         let d_prod = Arc::clone(&done);
         let o_prod = Arc::clone(&output);
 
-        let producer = thread::spawn(move || -> Result<CandleLlama> {
+        let producer = thread::spawn(move || -> Result<Llama> {
             let mut model = draft_model;
             let mut local_epoch: usize = 0;
             let mut next_token = last_prompt_token;
@@ -215,7 +209,7 @@ impl AsyncSpecPipeline {
         let o_cons = Arc::clone(&output);
         let st_cons = Arc::clone(&stats);
 
-        let consumer = thread::spawn(move || -> Result<CandleLlama> {
+        let consumer = thread::spawn(move || -> Result<Llama> {
             use rand::SeedableRng;
             let mut model = target_model;
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);

@@ -1,6 +1,6 @@
 use log::info;
 use pyo3::prelude::*;
-use spec_decode::{CandleLlama, Sampler, SamplerConfig, SpecDecoder};
+use spec_decode::{Llama, Sampler, SamplerConfig, SyncDecoder};
 
 /// Full speculative decoding engine using candle-transformers.
 ///
@@ -28,7 +28,7 @@ use spec_decode::{CandleLlama, Sampler, SamplerConfig, SpecDecoder};
 /// ```
 #[pyclass]
 pub struct SpecDecodingEngine {
-    decoder: SpecDecoder,
+    decoder: SyncDecoder,
     tokenizer: tokenizers::Tokenizer,
 }
 
@@ -88,14 +88,14 @@ impl SpecDecodingEngine {
             "loading draft model '{}' on {:?} ({:?})",
             draft_model_id, device, dtype
         );
-        let draft = CandleLlama::from_hub(draft_model_id, revision, &device, dtype)
+        let draft = Llama::from_hub(draft_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;
 
         info!(
             "loading target model '{}' on {:?} ({:?})",
             target_model_id, device, dtype
         );
-        let target = CandleLlama::from_hub(target_model_id, revision, &device, dtype)
+        let target = Llama::from_hub(target_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}")))?;
 
         let sampler_cfg = SamplerConfig {
@@ -111,7 +111,7 @@ impl SpecDecodingEngine {
         let tokenizer = spec_decode::model::load_tokenizer(target_model_id, revision)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}")))?;
 
-        let decoder = SpecDecoder::new(draft, target, sampler, gamma, seed);
+        let decoder = SyncDecoder::new(draft, target, sampler, gamma, seed);
 
         info!(
             "SpecDecodingEngine ready: gamma={}, temperature={}, seed={}",

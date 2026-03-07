@@ -23,13 +23,14 @@ use candle_core::Tensor;
 use log::{debug, info, trace};
 use rand::Rng;
 
-use crate::model::CandleLlama;
+use crate::decoder::stats::Stats;
+use crate::model::Llama;
 use crate::sampler::Sampler;
 
 /// Speculative decoder coordinating a draft and target model.
-pub struct SpecDecoder {
-    pub draft: CandleLlama,
-    pub target: CandleLlama,
+pub struct SyncDecoder {
+    pub draft: Llama,
+    pub target: Llama,
     pub sampler: Sampler,
     /// Number of draft tokens to generate per speculative step.
     pub gamma: usize,
@@ -39,15 +40,9 @@ pub struct SpecDecoder {
     epoch: usize,
 }
 
-impl SpecDecoder {
+impl SyncDecoder {
     /// Create a new speculative decoder.
-    pub fn new(
-        draft: CandleLlama,
-        target: CandleLlama,
-        sampler: Sampler,
-        gamma: usize,
-        seed: u64,
-    ) -> Self {
+    pub fn new(draft: Llama, target: Llama, sampler: Sampler, gamma: usize, seed: u64) -> Self {
         use rand::SeedableRng;
         Self {
             draft,
@@ -73,26 +68,15 @@ impl SpecDecoder {
     /// `tokens` is the full sequence generated so far (for repeat-penalty and
     /// cache rollback). Returns the newly accepted tokens to append.
     fn step(&mut self, tokens: &mut Vec<u32>) -> Result<StepResult> {
-        // ── 1. Draft phase ───────────────────────────────────────────
-        let mut draft_tokens = Vec::with_capacity(self.gamma);
-        let mut draft_probs_at_pos = Vec::with_capacity(self.gamma);
-
+        // 1. Draft phase
         // The last token in `tokens` is the most recently accepted token.
         // The draft model's KV cache already contains everything up to that
-        // point. We feed the last accepted token to get logits for the next
-        // position, then auto-regressively draft γ tokens.
-        let last_token = *tokens.last().unwrap();
-
-        // First draft step: feed the last accepted token.
-        let draft_logits = self.draft.forward(&[last_token], self.epoch)?;
-        let draft_p = Sampler::logits_to_probs(&draft_logits)?;
-        let draft_tok = self.sampler.sample(&draft_logits, tokens)?;
-        draft_tokens.push(draft_tok);
-        draft_probs_at_pos.push(draft_p);
-
-        // Remaining γ-1 draft steps
-        for _ in 1..self.gamma {
-            let prev = *draft_tokens.last().unwrap();
+        // point. We now auto-regressively draft γ tokens.
+        let mut draft_tokens = Vec::with_capacity(self.gamma);
+        let mut draft_probs_at_pos = Vec::with_capacity(self.gamma);
+        let last_accepted_token = *tokens.last().unwrap();
+        for _ in 0..self.gamma {
+            let prev = *draft_tokens.last().unwrap_or(&last_accepted_token);
             let draft_logits = self.draft.forward(&[prev], self.epoch)?;
             let draft_p = Sampler::logits_to_probs(&draft_logits)?;
             let draft_tok = self.sampler.sample(&draft_logits, tokens)?;
@@ -100,15 +84,15 @@ impl SpecDecoder {
             draft_probs_at_pos.push(draft_p);
         }
 
-        // ── 2. Verify phase ─────────────────────────────────────────
+        // 2. Verify phase
         // Feed the last accepted token + all draft tokens through the target
         // model one at a time, collecting logits at each position.
-        let verify_input: Vec<u32> = std::iter::once(last_token)
+        let verify_input: Vec<u32> = std::iter::once(last_accepted_token)
             .chain(draft_tokens.iter().copied())
             .collect();
         let target_logits_list = self.target.forward_each(&verify_input, self.epoch)?;
 
-        // ── 3. Rejection sampling ────────────────────────────────────
+        // 3. Rejection sampling
         let mut draft_accepted = 0;
 
         for i in 0..self.gamma {
@@ -154,7 +138,7 @@ impl SpecDecoder {
             }
         }
 
-        // ── 4. All accepted — bonus token ────────────────────────────
+        // 4. All accepted — sample a bonus token
         // Sample from the last target logits (position γ).
         debug!(
             "all {} draft tokens accepted, sampling bonus token",
@@ -166,8 +150,8 @@ impl SpecDecoder {
 
         // The draft model cache produced γ extra draft tokens that weren't
         // all verified. Truncate its cache to match the accepted length.
-        let new_len = tokens.len();
-        self.draft.truncate_cache_to(new_len);
+        // let new_len = tokens.len();
+        // self.draft.truncate_cache_to(new_len);
 
         Ok(StepResult {
             draft_accepted,
@@ -223,7 +207,7 @@ impl SpecDecoder {
 
         let initial_len = tokens.len();
         let mut total_generated = 0;
-        let mut stats = SpecStats::new();
+        let mut stats = Stats::new();
 
         info!(
             "starting speculative decoding: prompt_len={}, max_new_tokens={}, gamma={}",
@@ -282,55 +266,4 @@ struct StepResult {
     draft_proposed: usize,
     /// Whether an EOS token was generated.
     hit_eos: bool,
-}
-
-/// Statistics from a speculative decoding run.
-#[derive(Debug, Clone)]
-pub struct SpecStats {
-    /// Total number of draft tokens proposed across all steps.
-    pub draft_proposed: usize,
-    /// Number of draft tokens accepted by the target model.
-    pub draft_accepted: usize,
-    /// Total number of speculative decoding steps.
-    pub num_steps: usize,
-    /// Total tokens generated (including prompt).
-    pub total_tokens: usize,
-}
-
-impl SpecStats {
-    /// Create empty stats.
-    pub fn new() -> Self {
-        Self {
-            draft_proposed: 0,
-            draft_accepted: 0,
-            num_steps: 0,
-            total_tokens: 0,
-        }
-    }
-
-    /// Draft token acceptance rate as a fraction in [0.0, 1.0].
-    ///
-    /// Returns 0.0 if no tokens were proposed.
-    pub fn acceptance_rate(&self) -> f64 {
-        if self.draft_proposed == 0 {
-            0.0
-        } else {
-            self.draft_accepted as f64 / self.draft_proposed as f64
-        }
-    }
-
-    /// Average number of draft tokens accepted per step.
-    pub fn avg_accepted_per_step(&self) -> f64 {
-        if self.num_steps == 0 {
-            0.0
-        } else {
-            self.draft_accepted as f64 / self.num_steps as f64
-        }
-    }
-}
-
-impl Default for SpecStats {
-    fn default() -> Self {
-        Self::new()
-    }
 }

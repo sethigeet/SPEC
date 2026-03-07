@@ -1,9 +1,7 @@
-pub mod decode;
+pub mod decoder;
 pub mod model;
-pub mod pipeline;
 pub mod sampler;
 
-pub use decode::SpecDecoder;
-pub use model::{CandleLlama, ModelConfig};
-pub use pipeline::AsyncSpecPipeline;
+pub use decoder::{AsyncDecoder, SyncDecoder};
+pub use model::{Llama, ModelConfig};
 pub use sampler::{Sampler, SamplerConfig};

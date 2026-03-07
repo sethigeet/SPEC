@@ -10,16 +10,10 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{
     embedding, linear, linear_no_bias, Embedding, Linear, Module, RmsNorm, VarBuilder,
 };
-use candle_transformers::models::llama as llama_model;
+use candle_transformers::{models::llama as llama_model, utils::repeat_kv};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use spec_core::paged_kv_cache::{PagedCacheConfig, PagedKVCache, RopeScaling};
 use tokenizers::Tokenizer;
-
-// ─── Forked Internals ────────────────────────────────────────────────────────
-
-fn repeat_kv(x: Tensor, n_rep: usize) -> candle_core::Result<Tensor> {
-    candle_transformers::utils::repeat_kv(x, n_rep)
-}
 
 fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> candle_core::Result<Tensor> {
     let shape = mask.shape();
@@ -88,7 +82,7 @@ impl CausalSelfAttention {
         index_pos: usize,
         cache: &PagedKVCache,
     ) -> candle_core::Result<Tensor> {
-        let (_b_sz, _, seq_len, _hidden_size) = x.dims4()?;
+        let (_, _, seq_len, _) = x.dims4()?;
         let (cos, sin) = cache.cos_sin(index_pos, seq_len)?;
         candle_nn::rotary_emb::rope(x, &cos, &sin)
     }
@@ -116,35 +110,31 @@ impl CausalSelfAttention {
             .contiguous()?;
         let v = v
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
 
         let q = self.apply_rotary_emb(&q, index_pos, cache)?;
         let k = self.apply_rotary_emb(&k, index_pos, cache)?;
 
-        // ── Paged KV cache: append and retrieve ──────────────────────
         let (k, v) = cache.append_and_get(block_idx, k, v, epoch)?;
 
         let k_seq_len = k.dim(2)?;
         let (k, v) = if k_seq_len > self.max_position_embeddings {
-            let k = k
-                .narrow(
+            (
+                k.narrow(
                     2,
                     k_seq_len - self.max_position_embeddings,
                     self.max_position_embeddings,
                 )?
-                .contiguous()?;
-            let v_seq_len = v.dim(2)?;
-            let v = if v_seq_len > self.max_position_embeddings {
+                .contiguous()?,
                 v.narrow(
                     2,
-                    v_seq_len - self.max_position_embeddings,
+                    // NOTE: The k_seq_len and v_seq_len are the same, so we can use the same condition.
+                    k_seq_len - self.max_position_embeddings,
                     self.max_position_embeddings,
                 )?
-                .contiguous()?
-            } else {
-                v.contiguous()?
-            };
-            (k, v)
+                .contiguous()?,
+            )
         } else {
             (k.contiguous()?, v.contiguous()?)
         };
@@ -152,9 +142,9 @@ impl CausalSelfAttention {
         let y = if self.use_flash_attn {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)
             // It handles GQA natively, so no need for repeat_kv.
-            let q = q.transpose(1, 2)?;
-            let k = k.transpose(1, 2)?;
-            let v = v.transpose(1, 2)?;
+            let q = q.transpose(1, 2)?.contiguous()?;
+            let k = k.transpose(1, 2)?.contiguous()?;
+            let v = v.transpose(1, 2)?.contiguous()?;
             let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
             flash_attn(&q, &k, &v, softmax_scale, /* causal */ seq_len > 1)?.transpose(1, 2)?
         } else {
@@ -319,8 +309,6 @@ impl PagedLlama {
     }
 }
 
-// ─── Public Wrapper ──────────────────────────────────────────────────────────
-
 /// Configuration resolved at load time.
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -335,7 +323,7 @@ pub struct ModelConfig {
 const DEFAULT_MAX_KV_BLOCKS: usize = 4096;
 
 /// Wrapper around the forked Llama model with paged KV cache.
-pub struct CandleLlama {
+pub struct Llama {
     model: PagedLlama,
     pub cache: PagedKVCache,
     pub cfg: ModelConfig,
@@ -359,7 +347,7 @@ fn to_paged_cache_config(cfg: &llama_model::Config) -> PagedCacheConfig {
     }
 }
 
-impl CandleLlama {
+impl Llama {
     /// Load a Llama-family model from HuggingFace Hub.
     ///
     /// `model_id` — e.g. `"HuggingFaceTB/SmolLM2-135M"` or `"meta-llama/Llama-3.2-1B"`.
@@ -477,8 +465,8 @@ impl CandleLlama {
 
     /// Truncate the KV cache to `new_len` tokens.
     ///
-    /// This is much faster than the old approach of resetting and replaying,
-    /// because the paged cache can simply free blocks beyond `new_len`.
+    /// This is much faster than resetting and replaying, because the paged
+    /// cache can simply free blocks beyond `new_len`.
     pub fn truncate_cache_to(&mut self, new_len: usize) {
         self.cache.truncate_to(new_len);
     }

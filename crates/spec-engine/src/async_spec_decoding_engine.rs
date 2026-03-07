@@ -1,6 +1,6 @@
 use log::info;
 use pyo3::prelude::*;
-use spec_decode::{AsyncSpecPipeline, CandleLlama, Sampler, SamplerConfig};
+use spec_decode::{AsyncDecoder, Llama, Sampler, SamplerConfig};
 
 /// Async continuous speculative decoding engine.
 ///
@@ -28,7 +28,7 @@ use spec_decode::{AsyncSpecPipeline, CandleLlama, Sampler, SamplerConfig};
 /// ```
 #[pyclass]
 pub struct AsyncSpecDecodingEngine {
-    pipeline: AsyncSpecPipeline,
+    decoder: AsyncDecoder,
     tokenizer: tokenizers::Tokenizer,
 }
 
@@ -73,14 +73,14 @@ impl AsyncSpecDecodingEngine {
             "loading draft model '{}' on {:?} ({:?})",
             draft_model_id, device, dtype
         );
-        let draft = CandleLlama::from_hub(draft_model_id, revision, &device, dtype)
+        let draft = Llama::from_hub(draft_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;
 
         info!(
             "loading target model '{}' on {:?} ({:?})",
             target_model_id, device, dtype
         );
-        let target = CandleLlama::from_hub(target_model_id, revision, &device, dtype)
+        let target = Llama::from_hub(target_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}")))?;
 
         let sampler_cfg = SamplerConfig {
@@ -96,17 +96,14 @@ impl AsyncSpecDecodingEngine {
         let tokenizer = spec_decode::model::load_tokenizer(target_model_id, revision)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}")))?;
 
-        let pipeline = AsyncSpecPipeline::new(draft, target, sampler, gamma, seed);
+        let decoder = AsyncDecoder::new(draft, target, sampler, gamma, seed);
 
         info!(
             "AsyncSpecDecodingEngine ready: gamma={}, seed={}",
             gamma, seed
         );
 
-        Ok(Self {
-            pipeline,
-            tokenizer,
-        })
+        Ok(Self { decoder, tokenizer })
     }
 
     /// Generate text from a prompt using async speculative decoding.
@@ -119,7 +116,7 @@ impl AsyncSpecDecodingEngine {
     ///     The generated text (prompt + completion).
     #[pyo3(signature = (prompt, max_tokens = 100))]
     fn generate(&mut self, prompt: &str, max_tokens: usize) -> PyResult<String> {
-        self.pipeline.reset_caches();
+        self.decoder.reset_caches();
 
         let encoding = self
             .tokenizer
@@ -128,7 +125,7 @@ impl AsyncSpecDecodingEngine {
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
         let all_tokens = self
-            .pipeline
+            .decoder
             .generate(prompt_tokens, max_tokens)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("generate: {e}")))?;
 
@@ -154,10 +151,10 @@ impl AsyncSpecDecodingEngine {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
     ) -> PyResult<Vec<u32>> {
-        self.pipeline.reset_caches();
+        self.decoder.reset_caches();
 
         let all_tokens = self
-            .pipeline
+            .decoder
             .generate(prompt_tokens, max_tokens)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("generate: {e}")))?;
 
