@@ -6,7 +6,7 @@
 //! possible, with only the cache access points changed.
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{
     embedding, linear, linear_no_bias, Embedding, Linear, Module, RmsNorm, VarBuilder,
 };
@@ -278,13 +278,12 @@ impl PagedLlama {
         cache: &mut PagedKVCache,
         epoch: usize,
     ) -> candle_core::Result<Tensor> {
-        let (_b_sz, seq_len) = x.dims2()?;
+        let (_b_sz, _seq_len) = x.dims2()?;
         let mut x = self.wte.forward(x)?;
         for (block_idx, block) in self.blocks.iter().enumerate() {
             x = block.forward(&x, index_pos, block_idx, cache, epoch)?;
         }
         let x = self.ln_f.forward(&x)?;
-        let x = x.i((.., seq_len - 1, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&x)?;
         logits.to_dtype(DType::F32)
     }
@@ -427,10 +426,12 @@ impl Llama {
         Ok(Self { model, cache, cfg })
     }
 
-    /// Run a forward pass over `token_ids`, returning logits for the **last**
-    /// token only. Shape: `(vocab_size,)`.
+    /// Run a forward pass over `token_ids`, returning logits for every input
+    /// position. Shape: `(seq_len, vocab_size)`.
     ///
-    /// `epoch` tags the KV cache entries for rollback support.
+    /// Each row `i` contains the logits produced after consuming
+    /// `token_ids[..=i]`. `epoch` tags the KV cache entries for rollback
+    /// support.
     pub fn forward(&mut self, token_ids: &[u32], epoch: usize) -> Result<Tensor> {
         let dev = &self.cfg.device;
         let pos = self.cache.seq_len();
@@ -440,22 +441,6 @@ impl Llama {
             .forward(&input, pos, &mut self.cache, epoch)
             .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
         Ok(logits.squeeze(0)?)
-    }
-
-    /// Run `n` individual forward passes, one token at a time, collecting
-    /// logits at each position. Returns a `Vec<Tensor>` where each element has
-    /// shape `(vocab_size,)`.
-    ///
-    /// This is the verification strategy for the target model: we feed the
-    /// draft tokens one at a time so the KV cache accumulates correctly, and
-    /// we get the target probability distribution at each position.
-    pub fn forward_each(&mut self, token_ids: &[u32], epoch: usize) -> Result<Vec<Tensor>> {
-        let mut all_logits = Vec::with_capacity(token_ids.len());
-        for &tok in token_ids {
-            let logits = self.forward(&[tok], epoch)?;
-            all_logits.push(logits);
-        }
-        Ok(all_logits)
     }
 
     /// Reset the KV cache. Typically called when starting a fresh sequence.

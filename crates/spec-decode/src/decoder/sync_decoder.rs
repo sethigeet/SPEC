@@ -19,7 +19,7 @@
 //! ```
 
 use anyhow::Result;
-use candle_core::Tensor;
+use candle_core::{IndexOp, Tensor};
 use log::{debug, info, trace};
 use rand::Rng;
 
@@ -70,14 +70,22 @@ impl SyncDecoder {
     fn step(&mut self, tokens: &mut Vec<u32>) -> Result<StepResult> {
         // 1. Draft phase
         // The last token in `tokens` is the most recently accepted token.
-        // The draft model's KV cache already contains everything up to that
-        // point. We now auto-regressively draft γ tokens.
+        //
+        // Cache invariant in this decoder:
+        // - both models are kept one accepted token behind `tokens`
+        // - the next step starts by feeding `last_accepted_token`, which
+        //   lazily inserts that token into each model's KV cache
+        //
+        // So at the start of this loop, the draft cache contains the accepted
+        // prefix *before* `last_accepted_token`, and each call to
+        // `draft.forward([prev])` advances the cache by one token.
         let mut draft_tokens = Vec::with_capacity(self.gamma);
         let mut draft_probs_at_pos = Vec::with_capacity(self.gamma);
         let last_accepted_token = *tokens.last().unwrap();
         for _ in 0..self.gamma {
             let prev = *draft_tokens.last().unwrap_or(&last_accepted_token);
             let draft_logits = self.draft.forward(&[prev], self.epoch)?;
+            let draft_logits = draft_logits.i(0)?.contiguous()?;
             let draft_p = Sampler::logits_to_probs(&draft_logits)?;
             let draft_tok = self.sampler.sample(&draft_logits, tokens)?;
             draft_tokens.push(draft_tok);
@@ -85,18 +93,20 @@ impl SyncDecoder {
         }
 
         // 2. Verify phase
-        // Feed the last accepted token + all draft tokens through the target
-        // model one at a time, collecting logits at each position.
+        // Feed the entire verification sequence through the target model in
+        // one forward pass. Row `i` of the returned logits corresponds to the
+        // distribution after consuming `verify_input[..=i]`.
         let verify_input: Vec<u32> = std::iter::once(last_accepted_token)
             .chain(draft_tokens.iter().copied())
             .collect();
-        let target_logits_list = self.target.forward_each(&verify_input, self.epoch)?;
+        let target_logits = self.target.forward(&verify_input, self.epoch)?;
 
         // 3. Rejection sampling
         let mut draft_accepted = 0;
 
         for i in 0..self.gamma {
-            let target_p = Sampler::logits_to_probs(&target_logits_list[i])?;
+            let target_logits_at_pos = target_logits.i(i)?.contiguous()?;
+            let target_p = Sampler::logits_to_probs(&target_logits_at_pos)?;
             let draft_p = &draft_probs_at_pos[i];
             let drafted = draft_tokens[i] as usize;
 
@@ -122,12 +132,19 @@ impl SyncDecoder {
                 let correction_token = self.sample_correction(&target_p, draft_p)?;
                 tokens.push(correction_token);
 
-                // Rollback both model caches to the current position.
-                // With paged cache, this is O(1) — just free blocks beyond
-                // the accepted position.
+                // Roll back to the accepted prefix under the lazy-update
+                // invariant described above.
+                //
+                // `tokens` already includes the sampled correction token, but
+                // neither model has consumed that token yet. The target did
+                // consume speculative draft tokens during verification,
+                // including the rejected token, so both caches must be rolled
+                // back to the accepted prefix before the correction token.
+                // The next step then re-feeds `last_accepted_token` (now the
+                // correction token) and continues from the corrected sequence.
                 let new_len = tokens.len();
-                self.draft.truncate_cache_to(new_len);
-                self.target.truncate_cache_to(new_len);
+                self.draft.truncate_cache_to(new_len - 1);
+                self.target.truncate_cache_to(new_len - 1);
 
                 return Ok(StepResult {
                     draft_accepted,
@@ -144,14 +161,17 @@ impl SyncDecoder {
             "all {} draft tokens accepted, sampling bonus token",
             self.gamma
         );
-        let bonus_logits = &target_logits_list[self.gamma];
-        let bonus_token = self.sampler.sample(bonus_logits, tokens)?;
+        let bonus_logits = target_logits.i(self.gamma)?.contiguous()?;
+        let bonus_token = self.sampler.sample(&bonus_logits, tokens)?;
         tokens.push(bonus_token);
 
-        // The draft model cache produced γ extra draft tokens that weren't
-        // all verified. Truncate its cache to match the accepted length.
-        // let new_len = tokens.len();
-        // self.draft.truncate_cache_to(new_len);
+        // No rollback is needed here.
+        //
+        // The target model has already been advanced through the accepted
+        // prefix and the final verification position, so it is ready for the
+        // next step. The draft model intentionally remains one accepted token
+        // behind: the next call to `step` begins by feeding `bonus_token`,
+        // which lazily inserts it into the draft KV cache.
 
         Ok(StepResult {
             draft_accepted,

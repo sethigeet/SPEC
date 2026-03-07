@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::Result;
-use candle_core::Tensor;
+use candle_core::{IndexOp, Tensor};
 use log::{debug, info, trace};
 use rand::Rng;
 
@@ -169,7 +169,10 @@ impl AsyncDecoder {
 
                 // ── Draft one token ──────────────────────────────────
                 let logits = match model.forward(&[next_token], local_epoch) {
-                    Ok(l) => l,
+                    Ok(l) => match l.i(0).and_then(|t| t.contiguous()) {
+                        Ok(t) => t,
+                        Err(_) => break,
+                    },
                     Err(_) => break,
                 };
 
@@ -243,7 +246,13 @@ impl AsyncDecoder {
                     };
 
                     let target_logits = match model.forward(&[last_accepted], 0) {
-                        Ok(l) => l,
+                        Ok(l) => match l.i(0).and_then(|t| t.contiguous()) {
+                            Ok(t) => t,
+                            Err(_) => {
+                                d_cons.store(true, Ordering::Release);
+                                break;
+                            }
+                        },
                         Err(_) => {
                             d_cons.store(true, Ordering::Release);
                             break;
