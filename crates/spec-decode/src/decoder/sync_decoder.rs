@@ -24,13 +24,13 @@ use log::{debug, info, trace};
 use rand::Rng;
 
 use crate::decoder::stats::Stats;
-use crate::model::Llama;
+use crate::models::PagedLlama;
 use crate::sampler::Sampler;
 
 /// Speculative decoder coordinating a draft and target model.
 pub struct SyncDecoder {
-    pub draft: Llama,
-    pub target: Llama,
+    pub draft: PagedLlama,
+    pub target: PagedLlama,
     pub sampler: Sampler,
     /// Number of draft tokens to generate per speculative step.
     pub gamma: usize,
@@ -42,7 +42,13 @@ pub struct SyncDecoder {
 
 impl SyncDecoder {
     /// Create a new speculative decoder.
-    pub fn new(draft: Llama, target: Llama, sampler: Sampler, gamma: usize, seed: u64) -> Self {
+    pub fn new(
+        draft: PagedLlama,
+        target: PagedLlama,
+        sampler: Sampler,
+        gamma: usize,
+        seed: u64,
+    ) -> Self {
         use rand::SeedableRng;
         Self {
             draft,

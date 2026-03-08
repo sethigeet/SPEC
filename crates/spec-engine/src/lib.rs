@@ -1,7 +1,9 @@
 use pyo3::prelude::*;
 
 mod async_spec_decoding_engine;
+mod bare_model_engine;
 mod spec_decoding_engine;
+mod target_model_engine;
 
 /// Initialise the logger from the ``SPEC_LOG`` environment variable.
 ///
@@ -38,5 +40,11 @@ mod spec_module {
 
         #[pymodule_export]
         use crate::async_spec_decoding_engine::AsyncSpecDecodingEngine;
+
+        #[pymodule_export]
+        use crate::bare_model_engine::BareModelEngine;
+
+        #[pymodule_export]
+        use crate::target_model_engine::TargetModelEngine;
     }
 }

@@ -1,6 +1,6 @@
 use log::info;
 use pyo3::prelude::*;
-use spec_decode::{Llama, Sampler, SamplerConfig, SyncDecoder};
+use spec_decode::{PagedLlama, Sampler, SamplerConfig, SyncDecoder};
 
 /// Full speculative decoding engine using candle-transformers.
 ///
@@ -88,14 +88,14 @@ impl SpecDecodingEngine {
             "loading draft model '{}' on {:?} ({:?})",
             draft_model_id, device, dtype
         );
-        let draft = Llama::from_hub(draft_model_id, revision, &device, dtype)
+        let draft = PagedLlama::from_hub(draft_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;
 
         info!(
             "loading target model '{}' on {:?} ({:?})",
             target_model_id, device, dtype
         );
-        let target = Llama::from_hub(target_model_id, revision, &device, dtype)
+        let target = PagedLlama::from_hub(target_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}")))?;
 
         let sampler_cfg = SamplerConfig {
@@ -108,7 +108,7 @@ impl SpecDecodingEngine {
         };
         let sampler = Sampler::new(&sampler_cfg);
 
-        let tokenizer = spec_decode::model::load_tokenizer(target_model_id, revision)
+        let tokenizer = spec_decode::models::load_tokenizer(target_model_id, revision)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokenizer: {e}")))?;
 
         let decoder = SyncDecoder::new(draft, target, sampler, gamma, seed);

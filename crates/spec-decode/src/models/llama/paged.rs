@@ -1,9 +1,7 @@
 //! Forked Llama model using paged KV cache.
 //!
 //! This is a fork of `candle_transformers::models::llama` that replaces the
-//! default `Cache` with [`PagedKVCache`] from `spec-core`. The attention,
-//! block, and model structs are kept as close to candle's originals as
-//! possible, with only the cache access points changed.
+//! default `Cache` with [`PagedKVCache`] from `spec-core`.
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -13,7 +11,6 @@ use candle_nn::{
 use candle_transformers::{models::llama as llama_model, utils::repeat_kv};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use spec_core::paged_kv_cache::{PagedCacheConfig, PagedKVCache, RopeScaling};
-use tokenizers::Tokenizer;
 
 fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> candle_core::Result<Tensor> {
     let shape = mask.shape();
@@ -22,20 +19,15 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> candle_core::R
     Ok(m)
 }
 
-/// Some Llama-family checkpoints omit projection biases (e.g. SmolLM2).
-/// Try loading a biased linear first, then fall back to bias-free tensors.
 fn load_linear_with_optional_bias(
     in_features: usize,
     out_features: usize,
     vb: VarBuilder,
 ) -> candle_core::Result<Linear> {
-    // Some checkpoints (e.g. SmolLM2) do not include `*.bias`.
-    // So we fall back to a bias-free projection.
     let result = linear(in_features, out_features, vb.clone());
     if result.is_ok() {
         return result;
     }
-
     linear_no_bias(in_features, out_features, vb.clone())
 }
 
@@ -47,14 +39,7 @@ fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> candle_core::Result<Tensor> {
-    candle_flash_attn_v3::flash_attn(
-        q,
-        k,
-        v,
-        softmax_scale,
-        causal,
-        /* use_gqa_packing */ false,
-    )
+    candle_flash_attn_v3::flash_attn(q, k, v, softmax_scale, causal, false)
 }
 
 #[cfg(not(feature = "flash-attn"))]
@@ -62,7 +47,6 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> candle_cor
     unimplemented!("compile with '--features flash-attn'")
 }
 
-/// Forked causal self-attention that uses [`PagedKVCache`].
 struct CausalSelfAttention {
     q_proj: Linear,
     k_proj: Linear,
@@ -115,7 +99,6 @@ impl CausalSelfAttention {
 
         let q = self.apply_rotary_emb(&q, index_pos, cache)?;
         let k = self.apply_rotary_emb(&k, index_pos, cache)?;
-
         let (k, v) = cache.append_and_get(block_idx, k, v, epoch)?;
 
         let k_seq_len = k.dim(2)?;
@@ -129,7 +112,6 @@ impl CausalSelfAttention {
                 .contiguous()?,
                 v.narrow(
                     2,
-                    // NOTE: The k_seq_len and v_seq_len are the same, so we can use the same condition.
                     k_seq_len - self.max_position_embeddings,
                     self.max_position_embeddings,
                 )?
@@ -140,17 +122,14 @@ impl CausalSelfAttention {
         };
 
         let y = if self.use_flash_attn {
-            // flash-attn expects (b_sz, seq_len, nheads, head_dim)
-            // It handles GQA natively, so no need for repeat_kv.
             let q = q.transpose(1, 2)?.contiguous()?;
             let k = k.transpose(1, 2)?.contiguous()?;
             let v = v.transpose(1, 2)?.contiguous()?;
             let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-            flash_attn(&q, &k, &v, softmax_scale, /* causal */ seq_len > 1)?.transpose(1, 2)?
+            flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?.transpose(1, 2)?
         } else {
             let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
             let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
-
             let in_dtype = q.dtype();
             let q = q.to_dtype(DType::F32)?;
             let k = k.to_dtype(DType::F32)?;
@@ -162,28 +141,22 @@ impl CausalSelfAttention {
                 let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
                 masked_fill(&att, &mask, f32::NEG_INFINITY)?
             };
-
             let att = candle_nn::ops::softmax_last_dim(&att)?;
             att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
         };
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
-        let y = self.o_proj.forward(&y)?;
-        Ok(y)
+        self.o_proj.forward(&y)
     }
 
     fn load(vb: VarBuilder, cfg: &llama_model::Config) -> candle_core::Result<Self> {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        let q_proj = load_linear_with_optional_bias(size_in, size_q, vb.pp("q_proj"))?;
-        let k_proj = load_linear_with_optional_bias(size_in, size_kv, vb.pp("k_proj"))?;
-        let v_proj = load_linear_with_optional_bias(size_in, size_kv, vb.pp("v_proj"))?;
-        let o_proj = load_linear_with_optional_bias(size_q, size_in, vb.pp("o_proj"))?;
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
+            q_proj: load_linear_with_optional_bias(size_in, size_q, vb.pp("q_proj"))?,
+            k_proj: load_linear_with_optional_bias(size_in, size_kv, vb.pp("k_proj"))?,
+            v_proj: load_linear_with_optional_bias(size_in, size_kv, vb.pp("v_proj"))?,
+            o_proj: load_linear_with_optional_bias(size_q, size_in, vb.pp("o_proj"))?,
             num_attention_heads: cfg.num_attention_heads,
             num_key_value_heads: cfg.num_key_value_heads,
             head_dim: cfg.hidden_size / cfg.num_attention_heads,
@@ -208,13 +181,10 @@ impl Mlp {
     fn load(vb: VarBuilder, cfg: &llama_model::Config) -> candle_core::Result<Self> {
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
-        let c_fc1 = load_linear_with_optional_bias(h_size, i_size, vb.pp("gate_proj"))?;
-        let c_fc2 = load_linear_with_optional_bias(h_size, i_size, vb.pp("up_proj"))?;
-        let c_proj = load_linear_with_optional_bias(i_size, h_size, vb.pp("down_proj"))?;
         Ok(Self {
-            c_fc1,
-            c_fc2,
-            c_proj,
+            c_fc1: load_linear_with_optional_bias(h_size, i_size, vb.pp("gate_proj"))?,
+            c_fc2: load_linear_with_optional_bias(h_size, i_size, vb.pp("up_proj"))?,
+            c_proj: load_linear_with_optional_bias(i_size, h_size, vb.pp("down_proj"))?,
         })
     }
 }
@@ -239,38 +209,35 @@ impl Block {
         let x = self.rms_1.forward(x)?;
         let x = (self.attn.forward(&x, index_pos, block_idx, cache, epoch)? + residual)?;
         let residual = &x;
-        let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
-        Ok(x)
+        self.mlp.forward(&self.rms_2.forward(&x)?)? + residual
     }
 
     fn load(vb: VarBuilder, cfg: &llama_model::Config) -> candle_core::Result<Self> {
-        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg)?;
-        let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
-        let rms_1 =
-            candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let rms_2 = candle_nn::rms_norm(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
         Ok(Self {
-            rms_1,
-            attn,
-            rms_2,
-            mlp,
+            rms_1: candle_nn::rms_norm(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("input_layernorm"),
+            )?,
+            attn: CausalSelfAttention::load(vb.pp("self_attn"), cfg)?,
+            rms_2: candle_nn::rms_norm(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_attention_layernorm"),
+            )?,
+            mlp: Mlp::load(vb.pp("mlp"), cfg)?,
         })
     }
 }
 
-/// Forked Llama model using [`PagedKVCache`].
-struct PagedLlama {
+struct Model {
     wte: Embedding,
     blocks: Vec<Block>,
     ln_f: RmsNorm,
     lm_head: Linear,
 }
 
-impl PagedLlama {
+impl Model {
     fn forward(
         &self,
         x: &Tensor,
@@ -284,8 +251,7 @@ impl PagedLlama {
             x = block.forward(&x, index_pos, block_idx, cache, epoch)?;
         }
         let x = self.ln_f.forward(&x)?;
-        let logits = self.lm_head.forward(&x)?;
-        logits.to_dtype(DType::F32)
+        self.lm_head.forward(&x)?.to_dtype(DType::F32)
     }
 
     fn load(vb: VarBuilder, cfg: &llama_model::Config) -> candle_core::Result<Self> {
@@ -308,27 +274,22 @@ impl PagedLlama {
     }
 }
 
-/// Configuration resolved at load time.
 #[derive(Debug, Clone)]
-pub struct ModelConfig {
+pub struct PagedLlamaConfig {
     pub config: llama_model::Config,
     pub eos_token_id: Option<llama_model::LlamaEosToks>,
     pub device: Device,
     pub dtype: DType,
 }
 
-/// Default number of KV blocks for the paged cache when no explicit value is
-/// given. This should comfortably fit small-to-medium sequences on CPU.
 const DEFAULT_MAX_KV_BLOCKS: usize = 4096;
 
-/// Wrapper around the forked Llama model with paged KV cache.
-pub struct Llama {
-    model: PagedLlama,
+pub struct PagedLlama {
+    model: Model,
     pub cache: PagedKVCache,
-    pub cfg: ModelConfig,
+    pub cfg: PagedLlamaConfig,
 }
 
-/// Convert a candle Llama config into `PagedCacheConfig`.
 fn to_paged_cache_config(cfg: &llama_model::Config) -> PagedCacheConfig {
     let rope_scaling = cfg.rope_scaling.as_ref().map(|rs| RopeScaling {
         factor: rs.factor,
@@ -346,16 +307,11 @@ fn to_paged_cache_config(cfg: &llama_model::Config) -> PagedCacheConfig {
     }
 }
 
-impl Llama {
-    /// Load a Llama-family model from HuggingFace Hub.
-    ///
-    /// `model_id` — e.g. `"HuggingFaceTB/SmolLM2-135M"` or `"meta-llama/Llama-3.2-1B"`.
-    /// `revision`  — branch/tag, typically `"main"`.
+impl PagedLlama {
     pub fn from_hub(model_id: &str, revision: &str, device: &Device, dtype: DType) -> Result<Self> {
         Self::from_hub_with_blocks(model_id, revision, device, dtype, DEFAULT_MAX_KV_BLOCKS)
     }
 
-    /// Load with an explicit max KV block count.
     pub fn from_hub_with_blocks(
         model_id: &str,
         revision: &str,
@@ -369,22 +325,17 @@ impl Llama {
             RepoType::Model,
             revision.to_string(),
         ));
-
-        // Config
         let config_path = repo.get("config.json").context("config.json not found")?;
         let raw = std::fs::read(&config_path)?;
         let llama_config: llama_model::LlamaConfig = serde_json::from_slice(&raw)?;
         let eos_token_id = llama_config.eos_token_id.clone();
-        let use_flash_attn = cfg!(feature = "flash-attn");
-        let config = llama_config.into_config(use_flash_attn);
+        let config = llama_config.into_config(cfg!(feature = "flash-attn"));
 
-        // Weights — try single file first, fall back to sharded index
         let filenames = {
             let single = repo.get("model.safetensors");
             match single {
                 Ok(path) => vec![path],
                 Err(_) => {
-                    // sharded
                     let index_path = repo
                         .get("model.safetensors.index.json")
                         .context("neither model.safetensors nor index found")?;
@@ -410,32 +361,25 @@ impl Llama {
         let paged_cfg = to_paged_cache_config(&config);
         let cache = PagedKVCache::new(max_kv_blocks, &paged_cfg, device, dtype)
             .map_err(|e| anyhow::anyhow!("failed to create paged cache: {e}"))?;
-
-        // SAFETY: memory-mapped safetensors — candle's standard pattern
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device)? };
-        let model = PagedLlama::load(vb, &config)
-            .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
+        let model =
+            Model::load(vb, &config).map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
 
-        let cfg = ModelConfig {
-            config,
-            eos_token_id,
-            device: device.clone(),
-            dtype,
-        };
-
-        Ok(Self { model, cache, cfg })
+        Ok(Self {
+            model,
+            cache,
+            cfg: PagedLlamaConfig {
+                config,
+                eos_token_id,
+                device: device.clone(),
+                dtype,
+            },
+        })
     }
 
-    /// Run a forward pass over `token_ids`, returning logits for every input
-    /// position. Shape: `(seq_len, vocab_size)`.
-    ///
-    /// Each row `i` contains the logits produced after consuming
-    /// `token_ids[..=i]`. `epoch` tags the KV cache entries for rollback
-    /// support.
     pub fn forward(&mut self, token_ids: &[u32], epoch: usize) -> Result<Tensor> {
-        let dev = &self.cfg.device;
+        let input = Tensor::new(token_ids, &self.cfg.device)?.unsqueeze(0)?;
         let pos = self.cache.seq_len();
-        let input = Tensor::new(token_ids, dev)?.unsqueeze(0)?;
         let logits = self
             .model
             .forward(&input, pos, &mut self.cache, epoch)
@@ -443,25 +387,18 @@ impl Llama {
         Ok(logits.squeeze(0)?)
     }
 
-    /// Reset the KV cache. Typically called when starting a fresh sequence.
     pub fn reset_cache(&mut self) {
         self.cache.reset();
     }
 
-    /// Truncate the KV cache to `new_len` tokens.
-    ///
-    /// This is much faster than resetting and replaying, because the paged
-    /// cache can simply free blocks beyond `new_len`.
     pub fn truncate_cache_to(&mut self, new_len: usize) {
         self.cache.truncate_to(new_len);
     }
 
-    /// Rollback all KV cache entries from `dead_epoch`.
     pub fn rollback_cache(&mut self, dead_epoch: usize) {
         self.cache.rollback(dead_epoch);
     }
 
-    /// Check if a token is an EOS token.
     pub fn is_eos(&self, token: u32) -> bool {
         match &self.cfg.eos_token_id {
             Some(llama_model::LlamaEosToks::Single(id)) => token == *id,
@@ -469,19 +406,4 @@ impl Llama {
             None => false,
         }
     }
-}
-
-/// Load a tokenizer from HuggingFace Hub.
-pub fn load_tokenizer(model_id: &str, revision: &str) -> Result<Tokenizer> {
-    let api = Api::new()?;
-    let repo = api.repo(Repo::with_revision(
-        model_id.to_string(),
-        RepoType::Model,
-        revision.to_string(),
-    ));
-    let tokenizer_path = repo
-        .get("tokenizer.json")
-        .context("tokenizer.json not found")?;
-    Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))
 }
