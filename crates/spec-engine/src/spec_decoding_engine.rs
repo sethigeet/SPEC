@@ -144,7 +144,7 @@ impl SpecDecodingEngine {
         let all_tokens = self
             .decoder
             .generate(prompt_tokens, max_tokens)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("generate: {e}")))?;
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("generate: {e:?}")))?;
 
         let text = self
             .tokenizer
