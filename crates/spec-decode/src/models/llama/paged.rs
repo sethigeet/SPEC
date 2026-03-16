@@ -102,7 +102,7 @@ impl CausalSelfAttention {
         let (k, v) = cache.append_and_get(block_idx, k, v, epoch)?;
 
         let k_seq_len = k.dim(2)?;
-        let (k, v) = if k_seq_len > self.max_position_embeddings {
+        let (k, v, key_start) = if k_seq_len > self.max_position_embeddings {
             (
                 k.narrow(
                     2,
@@ -116,9 +116,10 @@ impl CausalSelfAttention {
                     self.max_position_embeddings,
                 )?
                 .contiguous()?,
+                k_seq_len - self.max_position_embeddings,
             )
         } else {
-            (k.contiguous()?, v.contiguous()?)
+            (k.contiguous()?, v.contiguous()?, 0)
         };
 
         let y = if self.use_flash_attn {
@@ -138,7 +139,9 @@ impl CausalSelfAttention {
             let att = if seq_len == 1 {
                 att
             } else {
-                let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
+                let mask = cache
+                    .mask(seq_len, k.dim(2)?, index_pos, key_start)?
+                    .broadcast_as(att.shape())?;
                 masked_fill(&att, &mask, f32::NEG_INFINITY)?
             };
             let att = candle_nn::ops::softmax_last_dim(&att)?;
@@ -383,7 +386,7 @@ impl PagedLlama {
         let logits = self
             .model
             .forward(&input, pos, &mut self.cache, epoch)
-            .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("forward failed: {e:?}"))?;
         Ok(logits.squeeze(0)?)
     }
 

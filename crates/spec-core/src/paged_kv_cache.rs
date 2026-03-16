@@ -7,8 +7,6 @@
 //! This module also owns the precomputed RoPE (cos/sin) tensors and the causal
 //! mask cache, which were previously part of candle's `Cache`.
 
-use std::collections::HashMap;
-
 use candle_core::{DType, Device, Result, Tensor};
 
 use crate::kv_metadata::KVBlockAllocator;
@@ -51,8 +49,6 @@ pub struct PagedKVCache {
     cos: Tensor,
     /// Precomputed RoPE sine values, shape `(max_position_embeddings, head_dim/2)`.
     sin: Tensor,
-    /// Cached causal masks keyed by sequence length.
-    masks: HashMap<usize, Tensor>,
     /// Device for mask creation.
     device: Device,
     /// Number of layers.
@@ -122,16 +118,15 @@ impl PagedKVCache {
             layer_blocks: vec![Vec::new(); num_layers],
             cos,
             sin,
-            masks: HashMap::new(),
             device: device.clone(),
             num_layers,
         })
     }
 
-    /// Append a K/V pair for `layer`, allocating a new block tagged with `epoch`.
+    /// Append K/V tensors for `layer`, allocating one block per token tagged with `epoch`.
     ///
     /// Returns the concatenated (K, V) for the full sequence at this layer
-    /// (including the newly appended entry). Returns `Err` if allocation fails.
+    /// (including the newly appended entries). Returns `Err` if allocation fails.
     pub fn append_and_get(
         &mut self,
         layer: usize,
@@ -139,13 +134,26 @@ impl PagedKVCache {
         v: Tensor,
         epoch: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let block_id = self
-            .allocator
-            .alloc(epoch)
-            .ok_or_else(|| candle_core::Error::Msg("PagedKVCache: out of blocks".into()))?;
+        let k_seq_len = k.dim(2)?;
+        let v_seq_len = v.dim(2)?;
+        if k_seq_len != v_seq_len {
+            return Err(candle_core::Error::Msg(
+                "PagedKVCache: K/V sequence lengths differ".into(),
+            ));
+        }
 
-        self.store[block_id] = Some((k, v));
-        self.layer_blocks[layer].push((block_id, epoch));
+        for token_idx in 0..k_seq_len {
+            let block_id = self
+                .allocator
+                .alloc(epoch)
+                .ok_or_else(|| candle_core::Error::Msg("PagedKVCache: out of blocks".into()))?;
+
+            let k_tok = k.narrow(2, token_idx, 1)?.contiguous()?;
+            let v_tok = v.narrow(2, token_idx, 1)?.contiguous()?;
+
+            self.store[block_id] = Some((k_tok, v_tok));
+            self.layer_blocks[layer].push((block_id, epoch));
+        }
 
         self.get_kv(layer)
     }
@@ -231,17 +239,27 @@ impl PagedKVCache {
         Ok((cos, sin))
     }
 
-    /// Causal mask of size `(t, t)`. Cached for reuse.
-    pub fn mask(&mut self, t: usize) -> Result<Tensor> {
-        if let Some(mask) = self.masks.get(&t) {
-            return Ok(mask.clone());
-        }
-        let mask: Vec<u8> = (0..t)
-            .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
+    /// Causal mask of size `(query_len, key_len)` for attention scores `QK^T`.
+    ///
+    /// `query_start` and `key_start` are absolute token positions of the first
+    /// query and key rows. A mask value of `1` means "masked out".
+    pub fn mask(
+        &mut self,
+        query_len: usize,
+        key_len: usize,
+        query_start: usize,
+        key_start: usize,
+    ) -> Result<Tensor> {
+        let mask: Vec<u8> = (0..query_len)
+            .flat_map(|i| {
+                (0..key_len).map(move |j| {
+                    let query_pos = query_start + i;
+                    let key_pos = key_start + j;
+                    u8::from(key_pos > query_pos)
+                })
+            })
             .collect();
-        let mask = Tensor::from_slice(&mask, (t, t), &self.device)?;
-        self.masks.insert(t, mask.clone());
-        Ok(mask)
+        Tensor::from_slice(&mask, (query_len, key_len), &self.device)
     }
 
     /// Returns the number of free blocks available for allocation.
@@ -299,6 +317,23 @@ mod tests {
         assert_eq!(full_k.dims(), &[1, 4, 2, head_dim]);
         assert_eq!(full_v.dims(), &[1, 4, 2, head_dim]);
         assert_eq!(cache.seq_len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn append_multi_token_input_tracks_token_length() -> Result<()> {
+        let cfg = test_config();
+        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let mut cache = PagedKVCache::new(32, &cfg, &Device::Cpu, DType::F32)?;
+
+        let k = Tensor::full(1.0, (1, 4, 3, head_dim), &Device::Cpu)?;
+        let v = Tensor::full(2.0, (1, 4, 3, head_dim), &Device::Cpu)?;
+        let (full_k, full_v) = cache.append_and_get(0, k, v, 0)?;
+
+        assert_eq!(full_k.dims(), &[1, 4, 3, head_dim]);
+        assert_eq!(full_v.dims(), &[1, 4, 3, head_dim]);
+        assert_eq!(cache.seq_len(), 3);
+        assert_eq!(cache.available_blocks(), 32 - 3);
         Ok(())
     }
 
@@ -407,7 +442,7 @@ mod tests {
         let cfg = test_config();
         let mut cache = PagedKVCache::new(8, &cfg, &Device::Cpu, DType::F32)?;
 
-        let mask = cache.mask(5)?;
+        let mask = cache.mask(5, 5, 0, 0)?;
         assert_eq!(mask.dims(), &[5, 5]);
 
         // Upper triangular: (0,0) should be 0, (0,1) should be 1
@@ -415,6 +450,20 @@ mod tests {
         assert_eq!(vals[0][0], 0);
         assert_eq!(vals[0][1], 1);
         assert_eq!(vals[1][1], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mask_shape_matches_cached_attention_scores() -> Result<()> {
+        let cfg = test_config();
+        let mut cache = PagedKVCache::new(8, &cfg, &Device::Cpu, DType::F32)?;
+
+        let mask = cache.mask(2, 5, 3, 0)?;
+        assert_eq!(mask.dims(), &[2, 5]);
+
+        let vals = mask.to_vec2::<u8>()?;
+        assert_eq!(vals[0], vec![0, 0, 0, 0, 1]);
+        assert_eq!(vals[1], vec![0, 0, 0, 0, 0]);
         Ok(())
     }
 }

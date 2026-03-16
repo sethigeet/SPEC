@@ -1,6 +1,6 @@
-from SPEC.SPEC.engines import SpecDecodingEngine
+from SPEC.SPEC import engines
 
-engine = SpecDecodingEngine(
+engine = engines.SpecDecodingEngine(
     draft_model_id="HuggingFaceTB/SmolLM2-135M",
     target_model_id="HuggingFaceTB/SmolLM2-360M",
     gamma=5,  # draft tokens per verification batch
