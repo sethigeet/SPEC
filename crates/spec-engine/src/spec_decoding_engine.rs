@@ -1,10 +1,10 @@
 use log::info;
 use pyo3::prelude::*;
-use spec_decode::{PagedLlama, Sampler, SamplerConfig, SyncDecoder};
+use spec_decode::{PagedModel, Sampler, SamplerConfig, SyncDecoder};
 
 /// Full speculative decoding engine using candle-transformers.
 ///
-/// Loads a draft and target Llama-family model from HuggingFace Hub, then
+/// Loads a supported draft and target causal LM from HuggingFace Hub, then
 /// generates tokens using the speculative decoding algorithm.
 ///
 /// Acceptance statistics are logged automatically - set the ``SPEC_LOG``
@@ -88,14 +88,14 @@ impl SpecDecodingEngine {
             "loading draft model '{}' on {:?} ({:?})",
             draft_model_id, device, dtype
         );
-        let draft = PagedLlama::from_hub(draft_model_id, revision, &device, dtype)
+        let draft = PagedModel::from_hub(draft_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("draft model: {e}")))?;
 
         info!(
             "loading target model '{}' on {:?} ({:?})",
             target_model_id, device, dtype
         );
-        let target = PagedLlama::from_hub(target_model_id, revision, &device, dtype)
+        let target = PagedModel::from_hub(target_model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("target model: {e}")))?;
 
         let sampler_cfg = SamplerConfig {

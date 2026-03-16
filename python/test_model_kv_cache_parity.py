@@ -1,4 +1,4 @@
-"""Parity tests between Candle's bare Llama model and SPEC's paged-KV model."""
+"""Parity tests between Candle's bare model and SPEC's paged-KV model."""
 
 import argparse
 from typing import Any
@@ -105,7 +105,7 @@ def _run_model_parity(cli: dict[str, Any]) -> None:
         assert_text_case_matches("TargetModelEngine", custom_engine, case)
 
 
-def test_custom_model_matches_bare_llama(pytestconfig):
+def test_custom_model_matches_bare_model(pytestconfig):
     cli = _cli_config_from_pytest(pytestconfig)
     if not cli["enabled"]:
         pytest.skip("pass --spec-model-parity to run bare-model parity tests")
@@ -117,4 +117,4 @@ if __name__ == "__main__":
 
     cli = _cli_config_from_args(sys.argv[1:])
     _run_model_parity(cli)
-    print("✓ test_custom_model_matches_bare_llama")
+    print("✓ test_custom_model_matches_bare_model")

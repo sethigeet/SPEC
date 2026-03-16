@@ -19,6 +19,7 @@ pub struct PagedCacheConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub hidden_size: usize,
+    pub head_dim: usize,
     pub rope_theta: f32,
     pub max_position_embeddings: usize,
     /// If set, applies Llama-3-style scaled RoPE.
@@ -55,8 +56,7 @@ pub struct PagedKVCache {
     num_layers: usize,
 }
 
-fn calculate_default_inv_freq(hidden_size: usize, num_heads: usize, rope_theta: f32) -> Vec<f32> {
-    let head_dim = hidden_size / num_heads;
+fn calculate_default_inv_freq(head_dim: usize, rope_theta: f32) -> Vec<f32> {
     (0..head_dim)
         .step_by(2)
         .map(|i| 1f32 / rope_theta.powf(i as f32 / head_dim as f32))
@@ -77,14 +77,14 @@ impl PagedKVCache {
 
         // ── RoPE precomputation (matches candle's Cache::new) ─────────
         let theta = match &cfg.rope_scaling {
-            None => calculate_default_inv_freq(cfg.hidden_size, cfg.num_attention_heads, cfg.rope_theta),
+            None => calculate_default_inv_freq(cfg.head_dim, cfg.rope_theta),
             Some(scaling) => {
                 let low_freq_wavelen =
                     scaling.original_max_position_embeddings as f32 / scaling.low_freq_factor;
                 let high_freq_wavelen =
                     scaling.original_max_position_embeddings as f32 / scaling.high_freq_factor;
 
-                calculate_default_inv_freq(cfg.hidden_size, cfg.num_attention_heads, cfg.rope_theta)
+                calculate_default_inv_freq(cfg.head_dim, cfg.rope_theta)
                     .into_iter()
                     .map(|freq| {
                         let wavelen = 2.0 * std::f32::consts::PI / freq;
@@ -283,6 +283,7 @@ mod tests {
             num_hidden_layers: 2,
             num_attention_heads: 4,
             hidden_size: 64,
+            head_dim: 16,
             rope_theta: 10000.0,
             max_position_embeddings: 128,
             rope_scaling: None,
@@ -297,7 +298,7 @@ mod tests {
     #[test]
     fn append_and_get_kv() -> Result<()> {
         let cfg = test_config();
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads; // 16
+        let head_dim = cfg.head_dim;
         let mut cache = PagedKVCache::new(32, &cfg, &Device::Cpu, DType::F32)?;
 
         let k1 = dummy_kv(4, head_dim, 1.0);
@@ -323,7 +324,7 @@ mod tests {
     #[test]
     fn append_multi_token_input_tracks_token_length() -> Result<()> {
         let cfg = test_config();
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
         let mut cache = PagedKVCache::new(32, &cfg, &Device::Cpu, DType::F32)?;
 
         let k = Tensor::full(1.0, (1, 4, 3, head_dim), &Device::Cpu)?;
@@ -340,7 +341,7 @@ mod tests {
     #[test]
     fn rollback_clears_dead_epoch() -> Result<()> {
         let cfg = test_config();
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
         let mut cache = PagedKVCache::new(32, &cfg, &Device::Cpu, DType::F32)?;
 
         // Epoch 0: 2 tokens
@@ -383,7 +384,7 @@ mod tests {
     #[test]
     fn reset_clears_all() -> Result<()> {
         let cfg = test_config();
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
         let mut cache = PagedKVCache::new(16, &cfg, &Device::Cpu, DType::F32)?;
 
         for _ in 0..5 {
@@ -401,7 +402,7 @@ mod tests {
     #[test]
     fn truncate_to() -> Result<()> {
         let cfg = test_config();
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
         let mut cache = PagedKVCache::new(32, &cfg, &Device::Cpu, DType::F32)?;
 
         for i in 0..5 {
@@ -431,7 +432,7 @@ mod tests {
         let cache = PagedKVCache::new(8, &cfg, &Device::Cpu, DType::F32)?;
 
         let (cos, sin) = cache.cos_sin(0, 4)?;
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
         assert_eq!(cos.dims(), &[4, head_dim / 2]);
         assert_eq!(sin.dims(), &[4, head_dim / 2]);
         Ok(())

@@ -1,12 +1,12 @@
 use candle_core::IndexOp;
 use log::info;
 use pyo3::prelude::*;
-use spec_decode::{BaseLlama, Sampler, SamplerConfig};
+use spec_decode::{BaseModel, Sampler, SamplerConfig};
 
-/// Plain Candle Llama engine without SPEC's custom paged KV cache.
+/// Plain Candle engine without SPEC's custom paged KV cache.
 #[pyclass]
 pub struct BareModelEngine {
-    model: BaseLlama,
+    model: BaseModel,
     sampler: Sampler,
     tokenizer: tokenizers::Tokenizer,
 }
@@ -50,7 +50,7 @@ impl BareModelEngine {
             "loading bare model '{}' on {:?} ({:?})",
             model_id, device, dtype
         );
-        let model = BaseLlama::from_hub(model_id, revision, &device, dtype)
+        let model = BaseModel::from_hub(model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("model: {e}")))?;
 
         let sampler_cfg = SamplerConfig {

@@ -31,7 +31,7 @@ use rand::Rng;
 use spec_core::{DraftQueue, DraftToken, EngineState};
 
 use crate::decoder::stats::Stats;
-use crate::models::PagedLlama;
+use crate::models::PagedModel;
 use crate::sampler::Sampler;
 
 /// Async continuous speculative decoding pipeline.
@@ -42,9 +42,9 @@ use crate::sampler::Sampler;
 pub struct AsyncDecoder {
     /// Draft model (small/fast). Wrapped in `Option` so we can move it to the
     /// producer thread and get it back after join.
-    draft: Option<PagedLlama>,
+    draft: Option<PagedModel>,
     /// Target model (large/accurate). Same `Option` pattern.
-    target: Option<PagedLlama>,
+    target: Option<PagedModel>,
     pub sampler: Sampler,
     /// Number of draft tokens to generate before the consumer tries to verify.
     pub gamma: usize,
@@ -55,8 +55,8 @@ pub struct AsyncDecoder {
 impl AsyncDecoder {
     /// Create a new async speculative decoding pipeline.
     pub fn new(
-        draft: PagedLlama,
-        target: PagedLlama,
+        draft: PagedModel,
+        target: PagedModel,
         sampler: Sampler,
         gamma: usize,
         seed: u64,
@@ -71,14 +71,14 @@ impl AsyncDecoder {
     }
 
     /// Mutable reference to the draft model. Panics if the model was consumed.
-    pub fn draft_mut(&mut self) -> &mut PagedLlama {
+    pub fn draft_mut(&mut self) -> &mut PagedModel {
         self.draft
             .as_mut()
             .expect("draft model not available (consumed by generate)")
     }
 
     /// Mutable reference to the target model. Panics if the model was consumed.
-    pub fn target_mut(&mut self) -> &mut PagedLlama {
+    pub fn target_mut(&mut self) -> &mut PagedModel {
         self.target
             .as_mut()
             .expect("target model not available (consumed by generate)")
@@ -143,7 +143,7 @@ impl AsyncDecoder {
         let d_prod = Arc::clone(&done);
         let o_prod = Arc::clone(&output);
 
-        let producer = thread::spawn(move || -> Result<PagedLlama> {
+        let producer = thread::spawn(move || -> Result<PagedModel> {
             let mut model = draft_model;
             let mut local_epoch: usize = 0;
             let mut next_token = last_prompt_token;
@@ -218,7 +218,7 @@ impl AsyncDecoder {
         let o_cons = Arc::clone(&output);
         let st_cons = Arc::clone(&stats);
 
-        let consumer = thread::spawn(move || -> Result<PagedLlama> {
+        let consumer = thread::spawn(move || -> Result<PagedModel> {
             use rand::SeedableRng;
             let mut model = target_model;
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);

@@ -1,7 +1,7 @@
 use candle_core::IndexOp;
 use log::info;
 use pyo3::prelude::*;
-use spec_decode::{PagedLlama, Sampler, SamplerConfig};
+use spec_decode::{PagedModel, Sampler, SamplerConfig};
 
 /// Full-size target model engine without speculative decoding.
 ///
@@ -9,7 +9,7 @@ use spec_decode::{PagedLlama, Sampler, SamplerConfig};
 /// speculative engines against the target model's direct output.
 #[pyclass]
 pub struct TargetModelEngine {
-    model: PagedLlama,
+    model: PagedModel,
     sampler: Sampler,
     tokenizer: tokenizers::Tokenizer,
 }
@@ -54,7 +54,7 @@ impl TargetModelEngine {
             "loading target-only model '{}' on {:?} ({:?})",
             model_id, device, dtype
         );
-        let model = PagedLlama::from_hub(model_id, revision, &device, dtype)
+        let model = PagedModel::from_hub(model_id, revision, &device, dtype)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("model: {e}")))?;
 
         let sampler_cfg = SamplerConfig {

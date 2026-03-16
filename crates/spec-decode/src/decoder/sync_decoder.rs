@@ -24,13 +24,13 @@ use log::{debug, info, trace};
 use rand::Rng;
 
 use crate::decoder::stats::Stats;
-use crate::models::PagedLlama;
+use crate::models::PagedModel;
 use crate::sampler::Sampler;
 
 /// Speculative decoder coordinating a draft and target model.
 pub struct SyncDecoder {
-    pub draft: PagedLlama,
-    pub target: PagedLlama,
+    pub draft: PagedModel,
+    pub target: PagedModel,
     pub sampler: Sampler,
     /// Number of draft tokens to generate per speculative step.
     pub gamma: usize,
@@ -43,8 +43,8 @@ pub struct SyncDecoder {
 impl SyncDecoder {
     /// Create a new speculative decoder.
     pub fn new(
-        draft: PagedLlama,
-        target: PagedLlama,
+        draft: PagedModel,
+        target: PagedModel,
         sampler: Sampler,
         gamma: usize,
         seed: u64,
@@ -198,7 +198,7 @@ impl SyncDecoder {
         let sum: f32 = adjusted.iter().sum();
         if sum <= 0.0 {
             // Fallback: sample from target distribution directly
-            let logits = Tensor::new(target_p, &self.target.cfg.device)?;
+            let logits = Tensor::new(target_p, self.target.device())?;
             return self.sampler.sample(&logits, &[]);
         }
 

@@ -304,6 +304,7 @@ fn to_paged_cache_config(cfg: &llama_model::Config) -> PagedCacheConfig {
         num_hidden_layers: cfg.num_hidden_layers,
         num_attention_heads: cfg.num_attention_heads,
         hidden_size: cfg.hidden_size,
+        head_dim: cfg.hidden_size / cfg.num_attention_heads,
         rope_theta: cfg.rope_theta,
         max_position_embeddings: cfg.max_position_embeddings,
         rope_scaling,
